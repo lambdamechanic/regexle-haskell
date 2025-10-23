@@ -1,0 +1,3 @@
+[submodule "third_party/nelhage-sandbox"]
+	path = third_party/nelhage-sandbox
+	url = https://github.com/nelhage/nelhage-sandbox

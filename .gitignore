@@ -1,0 +1,7 @@
+dist-newstyle/
+*.hi
+*.o
+cabal.project.local
+.stack-work/
+kleene-0.1/
+stats/
