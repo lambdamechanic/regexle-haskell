@@ -3,20 +3,31 @@
 module Main (main) where
 
 import Control.Monad (forM)
-import Data.Aeson (Value (Null), encode, object, (.=), toJSON)
+import qualified Data.Map.Strict as Map
+import Data.Aeson (ToJSON, Value (Null), encode, object, (.=), toJSON)
+import qualified Data.Aeson.Key as Key
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BL8
-import qualified Data.Text as T
-import Data.Char (isSpace)
+import Data.Char (isSpace, toLower)
 import Data.List (dropWhileEnd)
+import Data.Maybe (catMaybes)
+import qualified Data.Text as T
+import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
 import Options.Applicative
 import Regexle.PuzzleCache
   ( Puzzle (..)
   , fetchPuzzle
   )
 import Regexle.Solver
-  ( SolveResult (..)
-  , solvePuzzle
+  ( SolveBackend (..)
+  , SolveConfig (..)
+  , SolveResult (..)
+  , TransitionEncoding (..)
+  , defaultSolveConfig
+  , buildClues
+  , solvePuzzleWith
+  , solvePuzzleWithClues
+  , solvePuzzlesHot
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
@@ -41,11 +52,15 @@ data FetchOptions = FetchOptions
   }
   deriving (Show)
 
+data SolverStrategy
+  = StrategySBV TransitionEncoding
+  | StrategyDirectZ3
+  deriving (Eq, Show)
+
 data MatrixOptions = MatrixOptions
-  { moSideStart :: !Int
-  , moSideEnd :: !Int
-  , moDayStart :: !Int
-  , moDayEnd :: !Int
+  { moSides :: ![Int]
+  , moDays :: ![Int]
+  , moStrategies :: ![SolverStrategy]
   , moOutput :: !FilePath
   }
   deriving (Show)
@@ -53,6 +68,8 @@ data MatrixOptions = MatrixOptions
 data ProfileOptions = ProfileOptions
   { poSide :: !Int
   , poDays :: ![Int]
+  , poHotSolver :: !Bool
+  , poStrategy :: !SolverStrategy
   , poOutput :: !FilePath
   }
   deriving (Show)
@@ -98,36 +115,28 @@ matrixOptionsParser :: Parser MatrixOptions
 matrixOptionsParser =
   MatrixOptions
     <$> option
-      auto
-      ( long "side-start"
-          <> metavar "INT"
-          <> help "Minimum side (inclusive)"
+      (eitherReader parseRangeSpec)
+      ( long "sides"
+          <> metavar "SPEC"
+          <> help "Side list (e.g. 3..5 or 3,4)"
           <> showDefault
-          <> value 3
+          <> value [3 .. 8]
       )
     <*> option
-      auto
-      ( long "side-end"
-          <> metavar "INT"
-          <> help "Maximum side (inclusive)"
+      (eitherReader parseRangeSpec)
+      ( long "days"
+          <> metavar "SPEC"
+          <> help "Day list (e.g. 400..409 or 400,401)"
           <> showDefault
-          <> value 8
+          <> value [400 .. 449]
       )
     <*> option
-      auto
-      ( long "day-start"
-          <> metavar "INT"
-          <> help "Minimum day (inclusive)"
-          <> showDefault
-          <> value 400
-      )
-    <*> option
-      auto
-      ( long "day-end"
-          <> metavar "INT"
-          <> help "Maximum day (inclusive)"
-          <> showDefault
-          <> value 449
+      (eitherReader parseStrategyList)
+      ( long "strategies"
+          <> metavar "LIST"
+          <> help "Comma list of solver strategies (lookup,lambda,enum,z3)"
+          <> value [StrategySBV UseLookup, StrategySBV UseLambda, StrategyDirectZ3]
+          <> showDefaultWith (const "lookup,lambda,z3")
       )
     <*> strOption
       ( long "output"
@@ -150,12 +159,24 @@ profileOptionsParser =
           <> value 3
       )
     <*> option
-      (eitherReader parseDaySpec)
+      (eitherReader parseRangeSpec)
       ( long "days"
           <> metavar "SPEC"
           <> help "Day list (e.g. 400..409 or 400,401,405)"
           <> showDefault
           <> value [400 .. 409]
+      )
+    <*> switch
+      ( long "hot-solver"
+          <> help "Reuse a single solver session across all puzzles (experimental)"
+      )
+    <*> option
+      (eitherReader parseStrategySingle)
+      ( long "strategy"
+          <> metavar "NAME"
+          <> help "Solver strategy (lookup, lambda, enum, or z3)"
+          <> showDefaultWith (const "lambda")
+          <> value (StrategySBV UseLambda)
       )
     <*> strOption
       ( long "output"
@@ -172,20 +193,17 @@ runFetch FetchOptions {foDay = day, foSide = side} = do
   BL8.putStrLn (encode puzzle)
 
 runMatrix :: MatrixOptions -> IO ()
-runMatrix MatrixOptions { moSideStart = sideStart
-                        , moSideEnd = sideEnd
-                        , moDayStart = dayStart
-                        , moDayEnd = dayEnd
+runMatrix MatrixOptions { moSides = sides
+                        , moDays = days
+                        , moStrategies = strategies
                         , moOutput = outputPath
                         } = do
-  let sides = [sideStart .. sideEnd]
-      days = [dayStart .. dayEnd]
   entries <- fmap concat $
     forM sides $ \side -> do
       fmap concat $
         forM days $ \day -> do
           puzzle <- fetchPuzzle day side
-          forM (strategySpecs side) $ \spec -> matrixEntry puzzle spec
+          forM (strategySpecs strategies) $ \spec -> matrixEntry puzzle spec
 
   let outDir = takeDirectory outputPath
   createDirectoryIfMissing True outDir
@@ -199,14 +217,40 @@ runMatrix MatrixOptions { moSideStart = sideStart
 data StrategySpec = StrategySpec
   { ssName :: !String
   , ssConfig :: !Value
+  , ssSolveConfig :: !SolveConfig
   }
 
-strategySpecs :: Int -> [StrategySpec]
-strategySpecs _ = [StrategySpec "sbv_dfa" (object [])]
+strategySpecs :: [SolverStrategy] -> [StrategySpec]
+strategySpecs = map strategySpecFrom
+
+strategySpecFrom :: SolverStrategy -> StrategySpec
+strategySpecFrom strat =
+  case strat of
+    StrategySBV encoding ->
+      let label = strategyLabel strat
+          solverCfg =
+            defaultSolveConfig
+              { scBackend = BackendSBV
+              , scTransitionEncoding = encoding
+              }
+       in StrategySpec
+            { ssName = T.unpack label
+            , ssConfig = object
+                [ "backend" .= ("sbv" :: T.Text)
+                , "transition" .= strategyKernelLabel encoding
+                ]
+            , ssSolveConfig = solverCfg
+            }
+    StrategyDirectZ3 ->
+      StrategySpec
+        { ssName = T.unpack (strategyLabel StrategyDirectZ3)
+        , ssConfig = object ["backend" .= ("z3_direct" :: T.Text)]
+        , ssSolveConfig = defaultSolveConfig { scBackend = BackendZ3Direct }
+        }
 
 matrixEntry :: Puzzle -> StrategySpec -> IO Value
 matrixEntry puzzle spec = do
-  result <- solvePuzzle puzzle
+  result <- solvePuzzleWith (ssSolveConfig spec) puzzle
   let baseFields =
         [ "side" .= puzzleSide puzzle
         , "day" .= puzzleDay puzzle
@@ -215,59 +259,132 @@ matrixEntry puzzle spec = do
         ]
   case result of
     Left err ->
-      pure $ object (baseFields ++ ["error" .= err, "build_time" .= Null, "solve_time" .= Null, "z3_stats" .= object []])
+      pure $
+        object
+          ( baseFields
+              ++ [ "error" .= err
+                 , "build_time" .= Null
+                 , "solve_time" .= Null
+                 , "total_time" .= Null
+                 , "z3_stats" .= object []
+                 ]
+          )
     Right SolveResult { srBuildTime = buildTime, srSolveTime = solveTime, srGrid = gridLines } ->
       pure $
         object
           ( baseFields
               ++ [ "build_time" .= buildTime
                  , "solve_time" .= solveTime
+                 , "total_time" .= (buildTime + solveTime)
                  , "solution" .= map T.pack gridLines
                  , "z3_stats" .= object []
                  ]
           )
 
 runProfile :: ProfileOptions -> IO ()
-runProfile ProfileOptions {poSide = side, poDays = days, poOutput = outputPath} = do
-  runs <- forM days $ \day -> do
-    puzzle <- fetchPuzzle day side
-    result <- solvePuzzle puzzle
-    let base =
-          [ "side" .= side
-          , "day" .= day
-          ]
-    case result of
-      Left err ->
-        pure (object (base ++ ["error" .= err]), Nothing, Nothing)
-      Right SolveResult { srBuildTime = buildTime, srSolveTime = solveTime, srGrid = gridLines } ->
-        let entry =
-              object
-                ( base
-                    ++ [ "build_time" .= buildTime
-                       , "solve_time" .= solveTime
-                       , "solution" .= map T.pack gridLines
-                       , "z3_stats" .= object []
-                       ]
-                )
-         in pure (entry, Just buildTime, Just solveTime)
+runProfile ProfileOptions { poSide = side
+                          , poDays = days
+                          , poHotSolver = useHot
+                          , poStrategy = strategy
+                          , poOutput = outputPath
+                          } = do
+  let strategySpec = strategySpecFrom strategy
+      strategyNameText = T.pack (ssName strategySpec)
+      strategyConfigValue = ssConfig strategySpec
+      solverCfg = ssSolveConfig strategySpec
 
-  let totalRuns = length runs
-      successes = [ (b, s) | (_, Just b, Just s) <- runs ]
-      solvedCount = length successes
-      avgBuild = average (map fst successes)
-      avgSolve = average (map snd successes)
-      entries = map (\(entry, _, _) -> entry) runs
-      summaryValue =
-        object
-          [ "requested" .= totalRuns
-          , "solved" .= solvedCount
-          , "avg_build_time" .= maybe Null toJSON avgBuild
-          , "avg_solve_time" .= maybe Null toJSON avgSolve
-          ]
+  puzzleEntries <- forM days $ \day -> do
+    puzzle <- fetchPuzzle day side
+    case buildClues puzzle of
+      Left err -> pure (day, Left err)
+      Right clues -> pure (day, Right (puzzle, clues))
+
+  let jobs = [ (day, puzzle, clues) | (day, Right (puzzle, clues)) <- puzzleEntries ]
+
+  overallStart <- getCurrentTime
+
+  jobResults <-
+    if null jobs
+      then pure []
+      else
+        if useHot
+          then solvePuzzlesHot solverCfg (map (\(_, puzzle, clues) -> (puzzle, clues)) jobs)
+          else mapM (\(_, puzzle, clues) -> solvePuzzleWithClues solverCfg puzzle clues) jobs
+
+  overallEnd <- getCurrentTime
+
+  let jobAssoc = Map.fromList (zip (map (\(day, _, _) -> day) jobs) jobResults)
+      rows =
+        [ case entry of
+            Left err ->
+              ProfileRow
+                { prSide = side
+                , prDay = day
+                , prBuildTime = Nothing
+                , prSolveTime = Nothing
+                , prTotalTime = Nothing
+                , prSolution = Nothing
+                , prError = Just (T.pack err)
+                , prStrategy = strategyNameText
+                , prStrategyConfig = strategyConfigValue
+                , prZ3Stats = object []
+                }
+            Right _ ->
+              case Map.lookup day jobAssoc of
+                Nothing ->
+                  ProfileRow
+                    { prSide = side
+                    , prDay = day
+                    , prBuildTime = Nothing
+                    , prSolveTime = Nothing
+                    , prTotalTime = Nothing
+                    , prSolution = Nothing
+                    , prError = Just "Internal error: missing hot solver result"
+                    , prStrategy = strategyNameText
+                    , prStrategyConfig = strategyConfigValue
+                    , prZ3Stats = object []
+                    }
+                Just (Left err) ->
+                  ProfileRow
+                    { prSide = side
+                    , prDay = day
+                    , prBuildTime = Nothing
+                    , prSolveTime = Nothing
+                    , prTotalTime = Nothing
+                    , prSolution = Nothing
+                    , prError = Just (T.pack err)
+                    , prStrategy = strategyNameText
+                    , prStrategyConfig = strategyConfigValue
+                    , prZ3Stats = object []
+                    }
+                Just (Right SolveResult { srBuildTime = buildTime, srSolveTime = solveTime, srGrid = gridLines }) ->
+                  ProfileRow
+                    { prSide = side
+                    , prDay = day
+                    , prBuildTime = Just buildTime
+                    , prSolveTime = Just solveTime
+                    , prTotalTime = Just (buildTime + solveTime)
+                    , prSolution = Just (map T.pack gridLines)
+                    , prError = Nothing
+                    , prStrategy = strategyNameText
+                    , prStrategyConfig = strategyConfigValue
+                    , prZ3Stats = object []
+                    }
+        | (day, entry) <- puzzleEntries
+        ]
+
+  let totalRuns = length rows
+      buildSamples = catMaybes (map prBuildTime rows)
+      solveSamples = catMaybes (map prSolveTime rows)
+      solvedCount = length buildSamples
+      avgBuild = average buildSamples
+      avgSolve = average solveSamples
+      wallSeconds = toSeconds (diffUTCTime overallEnd overallStart)
+      jsonValue = profileToJson rows wallSeconds
 
   let outDir = takeDirectory outputPath
   createDirectoryIfMissing True outDir
-  BL.writeFile outputPath (encode (object ["runs" .= entries, "summary" .= summaryValue]))
+  BL.writeFile outputPath (encode jsonValue)
 
   putStrLn $
     "Profiled "
@@ -278,6 +395,8 @@ runProfile ProfileOptions {poSide = side, poDays = days, poOutput = outputPath} 
       <> displayMaybe avgBuild
       <> "s, avg solve "
       <> displayMaybe avgSolve
+      <> "s, total wall "
+      <> show wallSeconds
       <> "s. Results written to "
       <> outputPath
 
@@ -286,23 +405,88 @@ runProfile ProfileOptions {poSide = side, poDays = days, poOutput = outputPath} 
     average [] = Nothing
     average xs = Just (sum xs / fromIntegral (length xs))
 
+    toSeconds :: NominalDiffTime -> Double
+    toSeconds = realToFrac
+
     displayMaybe :: Maybe Double -> String
     displayMaybe = maybe "n/a" show
 
-parseDaySpec :: String -> Either String [Int]
-parseDaySpec spec =
-  fmap concat . traverse parseChunk $ map trim (splitComma spec)
+data ProfileRow = ProfileRow
+  { prSide :: !Int
+  , prDay :: !Int
+  , prBuildTime :: !(Maybe Double)
+  , prSolveTime :: !(Maybe Double)
+  , prTotalTime :: !(Maybe Double)
+  , prSolution :: !(Maybe [T.Text])
+  , prError :: !(Maybe T.Text)
+  , prStrategy :: !T.Text
+  , prStrategyConfig :: !Value
+  , prZ3Stats :: !Value
+  }
+
+profileToJson :: [ProfileRow] -> Double -> Value
+profileToJson rows wallSeconds =
+  object
+    ( columnPayload
+        ++ [ "_meta"
+             .= object
+                [ "wall_time_seconds" .= wallSeconds
+                , "rows" .= length rows
+                ]
+           ]
+    )
   where
-    splitComma :: String -> [String]
-    splitComma = foldr step [""]
-      where
-        step ',' acc = "" : acc
-        step c (x : xs) = (c : x) : xs
-        step _ [] = []
+    columnPayload =
+      [ "side" .= columnFrom (map (toJSON . prSide) rows)
+      , "day" .= columnFrom (map (toJSON . prDay) rows)
+      , "strategy" .= columnFrom (map (toJSON . prStrategy) rows)
+      , "strategy_config" .= columnFrom (map prStrategyConfig rows)
+      , "build_time" .= columnFrom (map (valueOrNull . prBuildTime) rows)
+      , "solve_time" .= columnFrom (map (valueOrNull . prSolveTime) rows)
+      , "total_time" .= columnFrom (map (valueOrNull . prTotalTime) rows)
+      , "solution" .= columnFrom (map (valueOrNull . prSolution) rows)
+      , "z3_stats" .= columnFrom (map prZ3Stats rows)
+      , "error" .= columnFrom (map (valueOrNull . prError) rows)
+      ]
 
-    trim :: String -> String
-    trim = dropWhileEnd isSpace . dropWhile isSpace
+valueOrNull :: ToJSON a => Maybe a -> Value
+valueOrNull = maybe Null toJSON
 
+columnFrom :: [Value] -> Value
+columnFrom vals =
+  object $
+    zipWith
+      (\idx val -> Key.fromText (T.pack (show idx)) .= val)
+      [0 :: Int ..]
+      vals
+
+strategyKernelLabel :: TransitionEncoding -> T.Text
+strategyKernelLabel UseLookup = "lookup"
+strategyKernelLabel UseLambda = "lambda"
+strategyKernelLabel UseEnum = "enum"
+
+strategyLabel :: SolverStrategy -> T.Text
+strategyLabel (StrategySBV enc) = "sbv_" <> strategyKernelLabel enc
+strategyLabel StrategyDirectZ3 = "z3_direct"
+
+parseStrategySingle :: String -> Either String SolverStrategy
+parseStrategySingle raw =
+  case map toLower (trimSpaces raw) of
+    "lookup" -> Right (StrategySBV UseLookup)
+    "lambda" -> Right (StrategySBV UseLambda)
+    "enum" -> Right (StrategySBV UseEnum)
+    "z3" -> Right StrategyDirectZ3
+    "direct" -> Right StrategyDirectZ3
+    "z3-direct" -> Right StrategyDirectZ3
+    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, or z3)"
+
+parseStrategyList :: String -> Either String [SolverStrategy]
+parseStrategyList spec = traverse parseStrategySingle (splitCommaFields spec)
+
+parseRangeSpec :: String -> Either String [Int]
+parseRangeSpec spec =
+  fmap concat . traverse parseChunk $ splitCommaFields spec
+  where
     parseChunk chunk =
       case break (== '.') chunk of
         (start, '.' : '.' : rest) ->
@@ -313,3 +497,13 @@ parseDaySpec spec =
           case reads chunk of
             [(n, "")] -> Right [n]
             _ -> Left $ "Invalid day: " <> chunk
+
+splitCommaFields :: String -> [String]
+splitCommaFields = map trimSpaces . foldr step [""]
+  where
+    step ',' acc = "" : acc
+    step c (x : xs) = (c : x) : xs
+    step _ [] = []
+
+trimSpaces :: String -> String
+trimSpaces = dropWhileEnd isSpace . dropWhile isSpace
