@@ -327,13 +327,16 @@ solvePuzzleZ3Direct encoding puzzle clues = do
   buildStart <- getCurrentTime
   stageRef <- newIORef "initializing"
   let sideVal = puzzleSide puzzle
+      stateCounts = map (max 1 . V.length . diTransitions . clueDfa) clues
+      globalStateCount = maximum (1 : stateCounts)
   resultOrErr <- (try $ Z3.evalZ3 $ do
     alphabetDomain <- mkAlphabetDomain alphabetCardinality
+    stateDomain <- mkStateDomain "GlobalState" globalStateCount
     liftIO (writeIORef stageRef "mkGrid")
     grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
-    forM_ clues $ \clue -> do
+    forM_ (zip clues stateCounts) $ \(clue, stateLimit) -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3 encoding alphabetDomain grid clue
+      applyClueZ3 encoding alphabetDomain stateDomain stateLimit grid clue
     liftIO (writeIORef stageRef "solverCheck")
     solveStart <- liftIO getCurrentTime
     (res, mModel) <- Z3.solverCheckAndGetModel
@@ -370,20 +373,22 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3 :: Z3TransitionEncoding -> AlphabetDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3 encoding alphabetDomain grid clue = do
+applyClueZ3 :: Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3 encoding alphabetDomain stateDomain stateLimit grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       dfaInfo = clueDfa clue
-      transitions = diTransitions dfaInfo
-      stateCount = max 1 (V.length transitions)
-  stateDomain <- mkStateDomain (clueLabel clue) stateCount
+      deadStates = diDeadStates dfaInfo
+      deadAlphabet = diDeadAlphabet dfaInfo
+      initialDead =
+        let vec = diDeadFrom dfaInfo
+         in if V.null vec then IntSet.empty else vec V.! diInitial dfaInfo
   transitionFn <- buildTransitionFunction encoding stateDomain alphabetDomain dfaInfo
   states <- mkStateVarsZ3 stateDomain (length chars) (clueAxis clue) (clueIndex clue)
-  restrictStatesZ3 stateDomain dfaInfo states
-  mapM_ (restrictDeadAlphabetZ3 alphabetDomain dfaInfo) chars
+  restrictStatesZ3 stateDomain stateLimit deadStates states
+  mapM_ (restrictAlphabetZ3 alphabetDomain deadAlphabet) chars
   case (states, chars) of
     (st0 : _, firstChar : _) -> do
-      restrictInitialZ3 alphabetDomain dfaInfo firstChar
+      restrictAlphabetZ3 alphabetDomain initialDead firstChar
       let initLit = stateLiteral stateDomain (diInitial dfaInfo)
       eq <- Z3.mkEq st0 initLit
       Z3.assert eq
@@ -402,29 +407,27 @@ mkStateVarsZ3 stateDomain len axis idx =
   forM [0 .. len] $ \i ->
     Z3.mkFreshConst ("state_" ++ [axis] ++ "_" ++ show idx ++ "_" ++ show i) (sdSort stateDomain)
 
-restrictStatesZ3 :: StateDomain -> DfaInfo -> [Z3.AST] -> Z3.Z3 ()
-restrictStatesZ3 stateDomain info states = do
-  let deadList = IntSet.toList (diDeadStates info)
+restrictStatesZ3 :: StateDomain -> Int -> IntSet.IntSet -> [Z3.AST] -> Z3.Z3 ()
+restrictStatesZ3 stateDomain stateLimit deadStates states = do
+  let domainSize = V.length (sdValues stateDomain)
+      bannedDead = [ stateLiteral stateDomain idx
+                   | idx <- IntSet.toList deadStates
+                   , idx >= 0
+                   , idx < domainSize
+                   ]
+      bannedAbove = [ stateLiteral stateDomain idx
+                    | idx <- [stateLimit .. domainSize - 1]
+                    ]
+      bannedLits = bannedDead ++ bannedAbove
   forM_ states $ \st ->
-    forM_ deadList $ \d -> do
-      let deadLit = stateLiteral stateDomain d
-      eq <- Z3.mkEq st deadLit
+    forM_ bannedLits $ \bad -> do
+      eq <- Z3.mkEq st bad
       neq <- Z3.mkNot eq
       Z3.assert neq
 
-restrictInitialZ3 :: AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.Z3 ()
-restrictInitialZ3 alphabetDomain info firstChar = do
-  let deadFrom = diDeadFrom info
-      initialDead = if V.null deadFrom then IntSet.empty else deadFrom V.! diInitial info
-  forM_ (IntSet.toList initialDead) $ \idx -> do
-    let idxLit = alphabetLiteral alphabetDomain idx
-    eq <- Z3.mkEq firstChar idxLit
-    neq <- Z3.mkNot eq
-    Z3.assert neq
-
-restrictDeadAlphabetZ3 :: AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.Z3 ()
-restrictDeadAlphabetZ3 alphabetDomain info cell =
-  forM_ (IntSet.toList (diDeadAlphabet info)) $ \idx -> do
+restrictAlphabetZ3 :: AlphabetDomain -> IntSet.IntSet -> Z3.AST -> Z3.Z3 ()
+restrictAlphabetZ3 alphabetDomain banned cell =
+  forM_ (IntSet.toList banned) $ \idx -> do
     let idxLit = alphabetLiteral alphabetDomain idx
     eq <- Z3.mkEq cell idxLit
     neq <- Z3.mkNot eq
