@@ -23,6 +23,7 @@ import Regexle.Solver
   , SolveConfig (..)
   , SolveResult (..)
   , TransitionEncoding (..)
+  , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
   , solvePuzzleWith
@@ -54,7 +55,7 @@ data FetchOptions = FetchOptions
 
 data SolverStrategy
   = StrategySBV TransitionEncoding
-  | StrategyDirectZ3
+  | StrategyDirectZ3 !Z3TransitionEncoding
   deriving (Eq, Show)
 
 data MatrixOptions = MatrixOptions
@@ -134,8 +135,8 @@ matrixOptionsParser =
       (eitherReader parseStrategyList)
       ( long "strategies"
           <> metavar "LIST"
-          <> help "Comma list of solver strategies (lookup,lambda,enum,z3)"
-          <> value [StrategySBV UseLookup, StrategySBV UseLambda, StrategyDirectZ3]
+          <> help "Comma list of solver strategies (lookup,lambda,enum,z3,z3-legacy)"
+          <> value [StrategySBV UseLookup, StrategySBV UseLambda, StrategyDirectZ3 Z3TransitionLambda]
           <> showDefaultWith (const "lookup,lambda,z3")
       )
     <*> strOption
@@ -174,7 +175,7 @@ profileOptionsParser =
       (eitherReader parseStrategySingle)
       ( long "strategy"
           <> metavar "NAME"
-          <> help "Solver strategy (lookup, lambda, enum, or z3)"
+          <> help "Solver strategy (lookup, lambda, enum, z3, or z3-legacy)"
           <> showDefaultWith (const "lambda")
           <> value (StrategySBV UseLambda)
       )
@@ -241,11 +242,17 @@ strategySpecFrom strat =
                 ]
             , ssSolveConfig = solverCfg
             }
-    StrategyDirectZ3 ->
+    StrategyDirectZ3 z3Enc ->
       StrategySpec
-        { ssName = T.unpack (strategyLabel StrategyDirectZ3)
-        , ssConfig = object ["backend" .= ("z3_direct" :: T.Text)]
-        , ssSolveConfig = defaultSolveConfig { scBackend = BackendZ3Direct }
+        { ssName = T.unpack (strategyLabel (StrategyDirectZ3 z3Enc))
+        , ssConfig = object
+            [ "backend" .= ("z3_direct" :: T.Text)
+            , "transition" .= z3TransitionKernelLabel z3Enc
+            ]
+        , ssSolveConfig = defaultSolveConfig
+            { scBackend = BackendZ3Direct
+            , scZ3TransitionEncoding = z3Enc
+            }
         }
 
 matrixEntry :: Puzzle -> StrategySpec -> IO Value
@@ -465,9 +472,13 @@ strategyKernelLabel UseLookup = "lookup"
 strategyKernelLabel UseLambda = "lambda"
 strategyKernelLabel UseEnum = "enum"
 
+z3TransitionKernelLabel :: Z3TransitionEncoding -> T.Text
+z3TransitionKernelLabel Z3TransitionLambda = "lambda"
+z3TransitionKernelLabel Z3TransitionLegacy = "legacy"
+
 strategyLabel :: SolverStrategy -> T.Text
 strategyLabel (StrategySBV enc) = "sbv_" <> strategyKernelLabel enc
-strategyLabel StrategyDirectZ3 = "z3_direct"
+strategyLabel (StrategyDirectZ3 enc) = "z3_" <> z3TransitionKernelLabel enc
 
 parseStrategySingle :: String -> Either String SolverStrategy
 parseStrategySingle raw =
@@ -475,10 +486,13 @@ parseStrategySingle raw =
     "lookup" -> Right (StrategySBV UseLookup)
     "lambda" -> Right (StrategySBV UseLambda)
     "enum" -> Right (StrategySBV UseEnum)
-    "z3" -> Right StrategyDirectZ3
-    "direct" -> Right StrategyDirectZ3
-    "z3-direct" -> Right StrategyDirectZ3
-    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, or z3)"
+    "z3" -> Right (StrategyDirectZ3 Z3TransitionLambda)
+    "direct" -> Right (StrategyDirectZ3 Z3TransitionLambda)
+    "z3-direct" -> Right (StrategyDirectZ3 Z3TransitionLambda)
+    "z3-lambda" -> Right (StrategyDirectZ3 Z3TransitionLambda)
+    "z3-legacy" -> Right (StrategyDirectZ3 Z3TransitionLegacy)
+    "z3-subst" -> Right (StrategyDirectZ3 Z3TransitionLegacy)
+    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, z3, or z3-legacy)"
 
 parseStrategyList :: String -> Either String [SolverStrategy]
 parseStrategyList spec = traverse parseStrategySingle (splitCommaFields spec)

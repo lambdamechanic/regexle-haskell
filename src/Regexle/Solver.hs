@@ -5,6 +5,7 @@ module Regexle.Solver
   , SolveConfig (..)
   , SolveResult (..)
   , TransitionEncoding (..)
+  , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
   , solvePuzzle
@@ -67,6 +68,9 @@ import Regexle.RegexParser (parseRegexToERE)
 data TransitionEncoding = UseLookup | UseLambda | UseEnum
   deriving (Eq, Show, Enum, Bounded)
 
+data Z3TransitionEncoding = Z3TransitionLegacy | Z3TransitionLambda
+  deriving (Eq, Show)
+
 data SolveBackend
   = BackendSBV
   | BackendZ3Direct
@@ -75,6 +79,7 @@ data SolveBackend
 data SolveConfig = SolveConfig
   { scBackend :: !SolveBackend
   , scTransitionEncoding :: !TransitionEncoding
+  , scZ3TransitionEncoding :: !Z3TransitionEncoding
   }
   deriving (Eq, Show)
 
@@ -83,6 +88,7 @@ defaultSolveConfig =
   SolveConfig
     { scBackend = BackendSBV
     , scTransitionEncoding = UseLambda
+    , scZ3TransitionEncoding = Z3TransitionLambda
     }
 
 -------------------------------------------------------------------------------
@@ -121,13 +127,13 @@ solvePuzzleWithClues :: SolveConfig -> Puzzle -> [Clue] -> IO (Either String Sol
 solvePuzzleWithClues cfg puzzle clues =
   case scBackend cfg of
     BackendSBV -> solvePuzzleSBV (scTransitionEncoding cfg) puzzle clues
-    BackendZ3Direct -> solvePuzzleZ3Direct puzzle clues
+    BackendZ3Direct -> solvePuzzleZ3Direct (scZ3TransitionEncoding cfg) puzzle clues
 
 solvePuzzlesHot :: SolveConfig -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesHot cfg puzzlesWithClues =
   case scBackend cfg of
     BackendSBV -> mapM (uncurry (solvePuzzleSBV (scTransitionEncoding cfg))) puzzlesWithClues
-    BackendZ3Direct -> mapM (uncurry solvePuzzleZ3Direct) puzzlesWithClues
+    BackendZ3Direct -> mapM (uncurry (solvePuzzleZ3Direct (scZ3TransitionEncoding cfg))) puzzlesWithClues
 
 -------------------------------------------------------------------------------
 -- SBV backend (existing implementation)
@@ -286,11 +292,13 @@ data StateDomain = StateDomain
   , sdValues :: !(V.Vector Z3.AST)
   }
 
-data TransitionFunction = TransitionFunction
-  { tfParamState :: !Z3.AST
-  , tfParamChar :: !Z3.AST
-  , tfExpr :: !Z3.AST
-  }
+data TransitionFunction
+  = TransitionLambda !Z3.AST
+  | TransitionSubstitute
+      { tfParamState :: !Z3.AST
+      , tfParamChar :: !Z3.AST
+      , tfExpr :: !Z3.AST
+      }
 
 mkAlphabetDomain :: Int -> Z3.Z3 AlphabetDomain
 mkAlphabetDomain n = do
@@ -314,8 +322,8 @@ alphabetLiteral dom idx = adValues dom V.! idx
 stateLiteral :: StateDomain -> Int -> Z3.AST
 stateLiteral dom idx = sdValues dom V.! idx
 
-solvePuzzleZ3Direct :: Puzzle -> [Clue] -> IO (Either String SolveResult)
-solvePuzzleZ3Direct puzzle clues = do
+solvePuzzleZ3Direct :: Z3TransitionEncoding -> Puzzle -> [Clue] -> IO (Either String SolveResult)
+solvePuzzleZ3Direct encoding puzzle clues = do
   buildStart <- getCurrentTime
   stageRef <- newIORef "initializing"
   let sideVal = puzzleSide puzzle
@@ -325,7 +333,7 @@ solvePuzzleZ3Direct puzzle clues = do
     grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
     forM_ clues $ \clue -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3 alphabetDomain grid clue
+      applyClueZ3 encoding alphabetDomain grid clue
     liftIO (writeIORef stageRef "solverCheck")
     solveStart <- liftIO getCurrentTime
     (res, mModel) <- Z3.solverCheckAndGetModel
@@ -362,14 +370,14 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3 :: AlphabetDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3 alphabetDomain grid clue = do
+applyClueZ3 :: Z3TransitionEncoding -> AlphabetDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3 encoding alphabetDomain grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       dfaInfo = clueDfa clue
       transitions = diTransitions dfaInfo
       stateCount = max 1 (V.length transitions)
   stateDomain <- mkStateDomain (clueLabel clue) stateCount
-  transitionFn <- buildTransitionFunction stateDomain alphabetDomain dfaInfo
+  transitionFn <- buildTransitionFunction encoding stateDomain alphabetDomain dfaInfo
   states <- mkStateVarsZ3 stateDomain (length chars) (clueAxis clue) (clueIndex clue)
   restrictStatesZ3 stateDomain dfaInfo states
   mapM_ (restrictDeadAlphabetZ3 alphabetDomain dfaInfo) chars
@@ -467,23 +475,42 @@ transitionLookupZ3 stateDomain alphabetDomain info st ch = do
       cond <- Z3.mkEq cell charLit
       Z3.mkIte cond dstLit acc
 
-buildTransitionFunction :: StateDomain -> AlphabetDomain -> DfaInfo -> Z3.Z3 TransitionFunction
-buildTransitionFunction stateDomain alphabetDomain info = do
-  stateParam <- Z3.mkFreshConst "delta_state" (sdSort stateDomain)
-  charParam <- Z3.mkFreshConst "delta_char" (adSort alphabetDomain)
-  expr <- transitionLookupZ3 stateDomain alphabetDomain info stateParam charParam
-  pure TransitionFunction
-    { tfParamState = stateParam
-    , tfParamChar = charParam
-    , tfExpr = expr
-    }
+buildTransitionFunction :: Z3TransitionEncoding -> StateDomain -> AlphabetDomain -> DfaInfo -> Z3.Z3 TransitionFunction
+buildTransitionFunction encoding stateDomain alphabetDomain info =
+  case encoding of
+    Z3TransitionLegacy -> buildSubstitute
+    Z3TransitionLambda -> buildLambda
+  where
+    buildSubstitute = do
+      stateParam <- Z3.mkFreshConst "delta_state" (sdSort stateDomain)
+      charParam <- Z3.mkFreshConst "delta_char" (adSort alphabetDomain)
+      expr <- transitionLookupZ3 stateDomain alphabetDomain info stateParam charParam
+      pure TransitionSubstitute
+        { tfParamState = stateParam
+        , tfParamChar = charParam
+        , tfExpr = expr
+        }
+    buildLambda = do
+      stateConst <- Z3.mkFreshConst "lambda_state" (sdSort stateDomain)
+      charConst <- Z3.mkFreshConst "lambda_char" (adSort alphabetDomain)
+      body <- transitionLookupZ3 stateDomain alphabetDomain info stateConst charConst
+      charApp <- Z3.toApp charConst
+      inner <- Z3.mkLambdaConst [charApp] body
+      stateApp <- Z3.toApp stateConst
+      outer <- Z3.mkLambdaConst [stateApp] inner
+      pure (TransitionLambda outer)
 
 applyTransitionFunction :: TransitionFunction -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
-applyTransitionFunction TransitionFunction { tfParamState = stateParam
-                                           , tfParamChar = charParam
-                                           , tfExpr = expr
-                                           } st ch =
-  Z3.substitute expr [(stateParam, st), (charParam, ch)]
+applyTransitionFunction transFn st ch =
+  case transFn of
+    TransitionLambda arr -> do
+      row <- Z3.mkSelect arr st
+      Z3.mkSelect row ch
+    TransitionSubstitute { tfParamState = stateParam
+                         , tfParamChar = charParam
+                         , tfExpr = expr
+                         } ->
+      Z3.substitute expr [(stateParam, st), (charParam, ch)]
 
 clueLabel :: Clue -> String
 clueLabel clue =
