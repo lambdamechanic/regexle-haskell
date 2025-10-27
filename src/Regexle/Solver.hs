@@ -21,8 +21,8 @@ module Regexle.Solver
   , hotDumpPuzzleFile
   ) where
 
-import Control.Exception (SomeException, displayException, try)
-import Control.Monad (foldM, forM, forM_, unless)
+import Control.Exception (SomeException, displayException, finally, try)
+import Control.Monad (foldM, forM, forM_)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.IntSet as IntSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -68,7 +68,7 @@ import Regexle.PuzzleCache
 import Regexle.RegexParser (parseRegexToERE)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>), takeFileName)
-import System.IO (Handle, IOMode (WriteMode), hClose, hPutStrLn, openFile, withFile)
+import System.IO (Handle, IOMode (WriteMode), hClose, hPutStrLn, openFile)
 import Text.Printf (printf)
 
 -------------------------------------------------------------------------------
@@ -314,16 +314,24 @@ data TransitionFunction
 
 data ConstraintSink = ConstraintSink
   { csEmit :: !(Z3.AST -> Z3.Z3 ())
+  , csDeclare :: !(Z3.AST -> Z3.Z3 ())
   }
 
 solverSink :: ConstraintSink
-solverSink = ConstraintSink { csEmit = Z3.assert }
+solverSink = ConstraintSink { csEmit = Z3.assert, csDeclare = const (pure ()) }
+
+data HotBaseSignature = HotBaseSignature
+  { hbsAlphabetSize :: !Int
+  , hbsStateSize :: !Int
+  , hbsGridDim :: !Int
+  }
+  deriving (Eq, Show)
 
 data HotDumpSpec = HotDumpSpec
   { hdsDir :: !FilePath
   , hdsBaseFile :: !FilePath
   , hdsDriverFile :: !FilePath
-  , hdsBaseDumped :: !(IORef Bool)
+  , hdsBaseDumped :: !(IORef (Maybe HotBaseSignature))
   , hdsPuzzleFiles :: !(IORef [(Int, FilePath)])
   }
 
@@ -332,10 +340,16 @@ hotDumpBaseFile = hdsBaseFile
 
 mkHotDumpSpec :: FilePath -> IO HotDumpSpec
 mkHotDumpSpec dir = do
-  baseRef <- newIORef False
+  createDirectoryIfMissing True dir
+  baseRef <- newIORef Nothing
   filesRef <- newIORef []
   let basePath = dir </> "base.smt2"
       driverPath = dir </> "driver.smt2"
+  writeFile driverPath . unlines $
+    [ printf "; hot solver driver for %s" dir
+    , printf "; replay via: cd %s && z3 driver.smt2" dir
+    , "(set-logic ALL)"
+    ]
   pure HotDumpSpec
     { hdsDir = dir
     , hdsBaseFile = basePath
@@ -351,22 +365,68 @@ recordPuzzleDump :: HotDumpSpec -> Int -> FilePath -> IO ()
 recordPuzzleDump spec day path =
   modifyIORef' (hdsPuzzleFiles spec) (<> [(day, path)])
 
-maybeDumpBase :: Maybe HotDumpSpec -> Z3.Z3 ()
-maybeDumpBase Nothing = pure ()
-maybeDumpBase (Just spec) = do
-  already <- liftIO (readIORef (hdsBaseDumped spec))
-  unless already $ do
-    solverStr <- Z3.solverToString
-    liftIO $ do
-      createDirectoryIfMissing True (hdsDir spec)
-      writeFile (hdsBaseFile spec) solverStr
-      writeIORef (hdsBaseDumped spec) True
+maybeDumpBase :: Maybe HotDumpSpec -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Z3.Z3 ()
+maybeDumpBase Nothing _ _ _ = pure ()
+maybeDumpBase (Just spec) alphabetDomain stateDomain grid = do
+  let signature = mkHotBaseSignature alphabetDomain stateDomain grid
+  recorded <- liftIO (readIORef (hdsBaseDumped spec))
+  case recorded of
+    Just existing
+      | existing == signature -> pure ()
+      | otherwise ->
+          liftIO $ ioError (userError baseMismatchMsg)
+    Nothing -> do
+      baseText <- renderBaseDump alphabetDomain stateDomain grid
+      liftIO $ do
+        writeFile (hdsBaseFile spec) baseText
+        writeIORef (hdsBaseDumped spec) (Just signature)
+        appendDriver spec (hdsBaseFile spec)
+  where
+    baseMismatchMsg =
+      unlines
+        [ "Hot dump directory " ++ hdsDir spec ++ " already contains a base context"
+        , "with incompatible dimensions or domain sizes."
+        , "Choose an empty directory or delete the previous dump before retrying."
+        ]
 
-buildLoggingSink :: Maybe HotDumpSpec -> Puzzle -> ConstraintSink -> Z3.Z3 (ConstraintSink, Maybe Handle)
+renderBaseDump :: AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Z3.Z3 String
+renderBaseDump alphabetDomain stateDomain grid = do
+  alphabetDecl <- renderDatatypeDecl (adSort alphabetDomain) (adValues alphabetDomain)
+  stateDecl <- renderDatatypeDecl (sdSort stateDomain) (sdValues stateDomain)
+  cellDecls <- renderGridDecls (adSort alphabetDomain) grid
+  let commentLine = printf "; dim=%d alphabet=%d state=%d" (length grid) (V.length (adValues alphabetDomain)) (V.length (sdValues stateDomain))
+  pure . unlines $
+    ["; shared hot solver base", commentLine]
+      ++ [alphabetDecl, stateDecl]
+      ++ cellDecls
+
+renderDatatypeDecl :: Z3.Sort -> V.Vector Z3.AST -> Z3.Z3 String
+renderDatatypeDecl sort values = do
+  sortName <- Z3.sortToString sort
+  ctorNames <- mapM Z3.astToString (V.toList values)
+  let ctorList = unwords (map wrapCtor ctorNames)
+  pure $ "(declare-datatypes ((" ++ sortName ++ " 0)) ((" ++ ctorList ++ ")))"
+  where
+    wrapCtor name = "(" ++ name ++ ")"
+
+renderGridDecls :: Z3.Sort -> [[Z3.AST]] -> Z3.Z3 [String]
+renderGridDecls sort grid = do
+  sortName <- Z3.sortToString sort
+  cellNames <- mapM (mapM Z3.astToString) grid
+  pure ["(declare-const " ++ cell ++ " " ++ sortName ++ ")" | cell <- concat cellNames]
+
+mkHotBaseSignature :: AlphabetDomain -> StateDomain -> [[Z3.AST]] -> HotBaseSignature
+mkHotBaseSignature alphabetDomain stateDomain grid =
+  HotBaseSignature
+    { hbsAlphabetSize = V.length (adValues alphabetDomain)
+    , hbsStateSize = V.length (sdValues stateDomain)
+    , hbsGridDim = length grid
+    }
+
+buildLoggingSink :: Maybe HotDumpSpec -> Puzzle -> ConstraintSink -> Z3.Z3 (ConstraintSink, Maybe (Handle, FilePath))
 buildLoggingSink Nothing _ sink = pure (sink, Nothing)
 buildLoggingSink (Just spec) puzzle sink = do
   let path = hotDumpPuzzleFile spec (puzzleDay puzzle)
-  liftIO $ createDirectoryIfMissing True (hdsDir spec)
   handle <- liftIO $ openFile path WriteMode
   liftIO $ do
     hPutStrLn handle $ printf "; puzzle %d" (puzzleDay puzzle)
@@ -377,25 +437,29 @@ buildLoggingSink (Just spec) puzzle sink = do
             csEmit sink ast
             rendered <- Z3.astToString ast
             liftIO $ hPutStrLn handle ("(assert " ++ rendered ++ ")")
+        , csDeclare = \ast -> do
+            declStr <- Z3.astToString ast
+            sort <- Z3.getSort ast
+            sortStr <- Z3.sortToString sort
+            liftIO $ hPutStrLn handle ("(declare-const " ++ declStr ++ " " ++ sortStr ++ ")")
         }
-  pure (loggingSink, Just handle)
+  pure (loggingSink, Just (handle, path))
 
-finalizePuzzleLog :: Maybe Handle -> String -> IO ()
-finalizePuzzleLog Nothing _ = pure ()
-finalizePuzzleLog (Just handle) comment = do
+finalizePuzzleLog :: Maybe HotDumpSpec -> Maybe (Handle, FilePath) -> String -> IO ()
+finalizePuzzleLog _ Nothing _ = pure ()
+finalizePuzzleLog mSpec (Just (handle, path)) comment = do
   hPutStrLn handle "(check-sat)"
   hPutStrLn handle $ "; result: " ++ comment
   hPutStrLn handle "(pop)"
   hClose handle
+  forM_ mSpec $ \spec -> appendDriver spec path
 
 finalizeHotDump :: HotDumpSpec -> IO ()
-finalizeHotDump spec = do
-  files <- readIORef (hdsPuzzleFiles spec)
-  withFile (hdsDriverFile spec) WriteMode $ \h -> do
-    hPutStrLn h "(set-logic ALL)"
-    hPutStrLn h $ "(include \"" ++ takeFileName (hdsBaseFile spec) ++ "\")"
-    forM_ files $ \(_, path) ->
-      hPutStrLn h $ "(include \"" ++ takeFileName path ++ "\")"
+finalizeHotDump _ = pure ()
+
+appendDriver :: HotDumpSpec -> FilePath -> IO ()
+appendDriver spec path =
+  appendFile (hdsDriverFile spec) $ "(include \"" ++ takeFileName path ++ "\")\n"
 
 mkAlphabetDomain :: Int -> Z3.Z3 AlphabetDomain
 mkAlphabetDomain n = do
@@ -477,14 +541,13 @@ solvePuzzleZ3Direct encoding puzzle clues = do
 -- Hot direct Z3 backend
 -------------------------------------------------------------------------------
 
-solvePuzzlesZ3DirectHotWithDump :: Maybe FilePath -> Int -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
-solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit encoding jobs = do
+solvePuzzlesZ3DirectHotWithDump :: Maybe FilePath -> Int -> Bool -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
+solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit dryRun encoding jobs = do
   mSpec <- traverse mkHotDumpSpec dumpDir
-  results <- fmap concat $ mapM (solveChunk mSpec) (chunkList chunkLimit jobs)
+  let runChunks = fmap concat $ mapM (solveChunk mSpec) (chunkList chunkLimit jobs)
   case mSpec of
-    Just spec -> finalizeHotDump spec
-    Nothing -> pure ()
-  pure results
+    Nothing -> runChunks
+    Just spec -> runChunks `finally` finalizeHotDump spec
   where
     solveChunk _ [] = pure []
     solveChunk spec chunk@((firstPuzzle, _) : _)
@@ -495,35 +558,42 @@ solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit encoding jobs = do
             alphabetDomain <- mkAlphabetDomain alphabetCardinality
             stateDomain <- mkStateDomain "GlobalStateHot" (chunkStateCount chunk)
             grid <- mkGridZ3 alphabetDomain (puzzleDiameter firstPuzzle)
-            maybeDumpBase spec
+            maybeDumpBase spec alphabetDomain stateDomain grid
             forM chunk $ \(puzzle, clues) -> do
               liftIO (writeIORef stageRef ("puzzle " ++ show (puzzleDay puzzle)))
               (sink, mHandle) <- buildLoggingSink spec puzzle solverSink
-              result <- Z3.local $ do
-                puzzleBuildStart <- liftIO getCurrentTime
-                forM_ clues $ \clue -> do
-                  let stateLimit = max 1 (V.length (diTransitions (clueDfa clue)))
-                  applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue
-                solveStart <- liftIO getCurrentTime
-                (res, mModel) <- Z3.solverCheckAndGetModel
-                solveEnd <- liftIO getCurrentTime
-                statsText <- Z3.solverGetStatistics
-                case (res, mModel) of
-                  (Z3.Sat, Just model) -> do
-                    values <- extractGridValues alphabetDomain puzzle grid model
-                    let buildTime = toSeconds (diffUTCTime solveStart puzzleBuildStart)
-                        solveTime = toSeconds (diffUTCTime solveEnd solveStart)
-                        rendered = renderGrid puzzle values
-                    pure $ Right
-                      SolveResult
-                        { srGrid = rendered
-                        , srBuildTime = buildTime
-                        , srSolveTime = solveTime
-                        , srStats = Just (T.pack statsText)
-                        }
-                  (Z3.Unsat, _) -> pure (Left "Z3 solver reported UNSAT")
-                  _ -> pure (Left "Z3 solver reported UNKNOWN")
-              liftIO $ finalizePuzzleLog mHandle (either id (const "sat") result)
+              result <-
+                if dryRun
+                  then Z3.local $ do
+                    forM_ clues $ \clue -> do
+                      let stateLimit = max 1 (V.length (diTransitions (clueDfa clue)))
+                      applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue
+                    pure (Left "dry-run (constraints dumped only)")
+                  else Z3.local $ do
+                    puzzleBuildStart <- liftIO getCurrentTime
+                    forM_ clues $ \clue -> do
+                      let stateLimit = max 1 (V.length (diTransitions (clueDfa clue)))
+                      applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue
+                    solveStart <- liftIO getCurrentTime
+                    (res, mModel) <- Z3.solverCheckAndGetModel
+                    solveEnd <- liftIO getCurrentTime
+                    statsText <- Z3.solverGetStatistics
+                    case (res, mModel) of
+                      (Z3.Sat, Just model) -> do
+                        values <- extractGridValues alphabetDomain puzzle grid model
+                        let buildTime = toSeconds (diffUTCTime solveStart puzzleBuildStart)
+                            solveTime = toSeconds (diffUTCTime solveEnd solveStart)
+                            rendered = renderGrid puzzle values
+                        pure $ Right
+                          SolveResult
+                            { srGrid = rendered
+                            , srBuildTime = buildTime
+                            , srSolveTime = solveTime
+                            , srStats = Just (T.pack statsText)
+                            }
+                      (Z3.Unsat, _) -> pure (Left "Z3 solver reported UNSAT")
+                      _ -> pure (Left "Z3 solver reported UNKNOWN")
+              liftIO $ finalizePuzzleLog spec mHandle (either id (const "sat") result)
               pure result
             ) :: IO (Either SomeException [Either String SolveResult])
           case resultOrErr of
@@ -551,15 +621,15 @@ chunkStateCount chunk =
 
 solvePuzzlesZ3DirectHot :: Maybe FilePath -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesZ3DirectHot dumpDir encoding jobs =
-  solvePuzzlesZ3DirectHotWithDump dumpDir maxHotBatchSize encoding jobs
+  solvePuzzlesZ3DirectHotWithDump dumpDir maxHotBatchSize False encoding jobs
 
 solvePuzzlesZ3DirectHotWithLimit :: Z3TransitionEncoding -> Int -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesZ3DirectHotWithLimit encoding chunkLimit jobs =
-  solvePuzzlesZ3DirectHotWithDump Nothing chunkLimit encoding jobs
+  solvePuzzlesZ3DirectHotWithDump Nothing chunkLimit False encoding jobs
 
 solvePuzzlesZ3DirectHotNoChunk :: Maybe FilePath -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesZ3DirectHotNoChunk dumpDir encoding jobs =
-  solvePuzzlesZ3DirectHotWithDump dumpDir 0 encoding jobs
+  solvePuzzlesZ3DirectHotWithDump dumpDir 0 False encoding jobs
 
 maxHotBatchSize :: Int
 maxHotBatchSize = 5
@@ -591,7 +661,7 @@ applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
         let vec = diDeadFrom dfaInfo
          in if V.null vec then IntSet.empty else vec V.! diInitial dfaInfo
   transitionFn <- buildTransitionFunction encoding stateDomain alphabetDomain dfaInfo
-  states <- mkStateVarsZ3 stateDomain (length chars) (clueAxis clue) (clueIndex clue)
+  states <- mkStateVarsZ3 sink stateDomain (length chars) (clueAxis clue) (clueIndex clue)
   restrictStatesZ3 sink stateDomain stateLimit deadStates states
   mapM_ (restrictAlphabetZ3 sink alphabetDomain deadAlphabet) chars
   case (states, chars) of
@@ -610,10 +680,13 @@ applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
     Just finalState -> assertAcceptStateZ3 sink stateDomain dfaInfo finalState
     Nothing -> pure ()
 
-mkStateVarsZ3 :: StateDomain -> Int -> Char -> Int -> Z3.Z3 [Z3.AST]
-mkStateVarsZ3 stateDomain len axis idx =
+mkStateVarsZ3 :: ConstraintSink -> StateDomain -> Int -> Char -> Int -> Z3.Z3 [Z3.AST]
+mkStateVarsZ3 sink stateDomain len axis idx =
   forM [0 .. len] $ \i ->
-    Z3.mkFreshConst ("state_" ++ [axis] ++ "_" ++ show idx ++ "_" ++ show i) (sdSort stateDomain)
+    do
+      ast <- Z3.mkFreshConst ("state_" ++ [axis] ++ "_" ++ show idx ++ "_" ++ show i) (sdSort stateDomain)
+      csDeclare sink ast
+      pure ast
 
 restrictStatesZ3 :: ConstraintSink -> StateDomain -> Int -> IntSet.IntSet -> [Z3.AST] -> Z3.Z3 ()
 restrictStatesZ3 sink stateDomain stateLimit deadStates states = do
