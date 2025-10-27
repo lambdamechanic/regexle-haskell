@@ -29,8 +29,7 @@ import Regexle.Solver
   , solvePuzzleWith
   , solvePuzzleWithClues
   , solvePuzzlesHot
-  , solvePuzzlesZ3DirectHotNoChunk
-  , solvePuzzlesZ3DirectHotWithLimit
+  , solvePuzzlesZ3DirectHotWithDump
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
@@ -83,6 +82,7 @@ data ReproOptions = ReproOptions
   { roSide :: !Int
   , roDays :: ![Int]
   , roChunkSize :: !Int
+  , roDumpDir :: !(Maybe FilePath)
   }
   deriving (Show)
 
@@ -232,6 +232,13 @@ reproOptionsParser =
           <> showDefault
           <> value 0
       )
+    <*> optional
+      ( strOption
+          ( long "dump-dir"
+              <> metavar "DIR"
+              <> help "Optional directory to dump SMT2 files and driver"
+          )
+      )
 
 runFetch :: FetchOptions -> IO ()
 runFetch FetchOptions {foDay = day, foSide = side} = do
@@ -264,6 +271,7 @@ runReproHot :: ReproOptions -> IO ()
 runReproHot ReproOptions { roSide = side
                          , roDays = days
                          , roChunkSize = chunkSize
+                         , roDumpDir = dumpDir
                          } = do
   when (null days) $ fail "repro-hot: no days provided"
   putStrLn $ "Fetching " <> show (length days) <> " puzzles"
@@ -275,9 +283,7 @@ runReproHot ReproOptions { roSide = side
 
   let solveCfg = defaultSolveConfig { scBackend = BackendZ3Direct }
       encoding = scZ3TransitionEncoding solveCfg
-      runAction
-        | chunkSize <= 0 = solvePuzzlesZ3DirectHotNoChunk encoding puzzlesWithClues
-        | otherwise = solvePuzzlesZ3DirectHotWithLimit encoding chunkSize puzzlesWithClues
+      runAction = solvePuzzlesZ3DirectHotWithDump dumpDir chunkSize encoding puzzlesWithClues
 
   putStrLn $ "Invoking hot solver with chunk size = " <> show chunkSize
   results <- runAction

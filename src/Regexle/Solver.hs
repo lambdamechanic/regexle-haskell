@@ -12,13 +12,20 @@ module Regexle.Solver
   , solvePuzzleWith
   , solvePuzzleWithClues
   , solvePuzzlesHot
+  , solvePuzzlesZ3DirectHot
+  , solvePuzzlesZ3DirectHotWithLimit
+  , solvePuzzlesZ3DirectHotNoChunk
+  , solvePuzzlesZ3DirectHotWithDump
+  , HotDumpSpec (..)
+  , hotDumpBaseFile
+  , hotDumpPuzzleFile
   ) where
 
 import Control.Exception (SomeException, displayException, try)
-import Control.Monad (foldM, forM, forM_)
+import Control.Monad (foldM, forM, forM_, unless)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.IntSet as IntSet
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -48,7 +55,6 @@ import Data.SBV.Control
   , query
   )
 import qualified Z3.Monad as Z3
-import Text.Read (readMaybe)
 
 import Regexle.DFA
   ( DfaInfo (..)
@@ -60,6 +66,10 @@ import Regexle.PuzzleCache
   ( Puzzle (..)
   )
 import Regexle.RegexParser (parseRegexToERE)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath ((</>), takeFileName)
+import System.IO (Handle, IOMode (WriteMode), hClose, hPutStrLn, openFile, withFile)
+import Text.Printf (printf)
 
 -------------------------------------------------------------------------------
 -- Types and configuration
@@ -107,8 +117,12 @@ data SolveResult = SolveResult
   { srGrid :: [[Char]]
   , srBuildTime :: !Double
   , srSolveTime :: !Double
+  , srStats :: !(Maybe T.Text)
   }
   deriving (Eq, Show)
+
+toSeconds :: NominalDiffTime -> Double
+toSeconds = realToFrac
 
 -------------------------------------------------------------------------------
 -- Public API
@@ -133,7 +147,8 @@ solvePuzzlesHot :: SolveConfig -> [(Puzzle, [Clue])] -> IO [Either String SolveR
 solvePuzzlesHot cfg puzzlesWithClues =
   case scBackend cfg of
     BackendSBV -> mapM (uncurry (solvePuzzleSBV (scTransitionEncoding cfg))) puzzlesWithClues
-    BackendZ3Direct -> mapM (uncurry (solvePuzzleZ3Direct (scZ3TransitionEncoding cfg))) puzzlesWithClues
+    BackendZ3Direct ->
+      solvePuzzlesZ3DirectHot Nothing (scZ3TransitionEncoding cfg) puzzlesWithClues
 
 -------------------------------------------------------------------------------
 -- SBV backend (existing implementation)
@@ -166,10 +181,7 @@ solvePuzzleSBV _encoding puzzle clues = do
       let buildTime = toSeconds (diffUTCTime solveStart buildStart)
           solveTime = toSeconds (diffUTCTime solveEnd solveStart)
           rendered = renderGrid puzzle model
-      pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime})
-  where
-    toSeconds :: NominalDiffTime -> Double
-    toSeconds = realToFrac
+      pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime, srStats = Nothing})
 
 mkGrid :: Int -> Symbolic [[SWord8]]
 mkGrid dim =
@@ -300,21 +312,117 @@ data TransitionFunction
       , tfExpr :: !Z3.AST
       }
 
+data ConstraintSink = ConstraintSink
+  { csEmit :: !(Z3.AST -> Z3.Z3 ())
+  }
+
+solverSink :: ConstraintSink
+solverSink = ConstraintSink { csEmit = Z3.assert }
+
+data HotDumpSpec = HotDumpSpec
+  { hdsDir :: !FilePath
+  , hdsBaseFile :: !FilePath
+  , hdsDriverFile :: !FilePath
+  , hdsBaseDumped :: !(IORef Bool)
+  , hdsPuzzleFiles :: !(IORef [(Int, FilePath)])
+  }
+
+hotDumpBaseFile :: HotDumpSpec -> FilePath
+hotDumpBaseFile = hdsBaseFile
+
+mkHotDumpSpec :: FilePath -> IO HotDumpSpec
+mkHotDumpSpec dir = do
+  baseRef <- newIORef False
+  filesRef <- newIORef []
+  let basePath = dir </> "base.smt2"
+      driverPath = dir </> "driver.smt2"
+  pure HotDumpSpec
+    { hdsDir = dir
+    , hdsBaseFile = basePath
+    , hdsDriverFile = driverPath
+    , hdsBaseDumped = baseRef
+    , hdsPuzzleFiles = filesRef
+    }
+
+hotDumpPuzzleFile :: HotDumpSpec -> Int -> FilePath
+hotDumpPuzzleFile spec day = hdsDir spec </> printf "puzzle-%04d.smt2" day
+
+recordPuzzleDump :: HotDumpSpec -> Int -> FilePath -> IO ()
+recordPuzzleDump spec day path =
+  modifyIORef' (hdsPuzzleFiles spec) (<> [(day, path)])
+
+maybeDumpBase :: Maybe HotDumpSpec -> Z3.Z3 ()
+maybeDumpBase Nothing = pure ()
+maybeDumpBase (Just spec) = do
+  already <- liftIO (readIORef (hdsBaseDumped spec))
+  unless already $ do
+    solverStr <- Z3.solverToString
+    liftIO $ do
+      createDirectoryIfMissing True (hdsDir spec)
+      writeFile (hdsBaseFile spec) solverStr
+      writeIORef (hdsBaseDumped spec) True
+
+buildLoggingSink :: Maybe HotDumpSpec -> Puzzle -> ConstraintSink -> Z3.Z3 (ConstraintSink, Maybe Handle)
+buildLoggingSink Nothing _ sink = pure (sink, Nothing)
+buildLoggingSink (Just spec) puzzle sink = do
+  let path = hotDumpPuzzleFile spec (puzzleDay puzzle)
+  liftIO $ createDirectoryIfMissing True (hdsDir spec)
+  handle <- liftIO $ openFile path WriteMode
+  liftIO $ do
+    hPutStrLn handle $ printf "; puzzle %d" (puzzleDay puzzle)
+    hPutStrLn handle "(push)"
+    recordPuzzleDump spec (puzzleDay puzzle) path
+  let loggingSink = ConstraintSink
+        { csEmit = \ast -> do
+            csEmit sink ast
+            rendered <- Z3.astToString ast
+            liftIO $ hPutStrLn handle ("(assert " ++ rendered ++ ")")
+        }
+  pure (loggingSink, Just handle)
+
+finalizePuzzleLog :: Maybe Handle -> String -> IO ()
+finalizePuzzleLog Nothing _ = pure ()
+finalizePuzzleLog (Just handle) comment = do
+  hPutStrLn handle "(check-sat)"
+  hPutStrLn handle $ "; result: " ++ comment
+  hPutStrLn handle "(pop)"
+  hClose handle
+
+finalizeHotDump :: HotDumpSpec -> IO ()
+finalizeHotDump spec = do
+  files <- readIORef (hdsPuzzleFiles spec)
+  withFile (hdsDriverFile spec) WriteMode $ \h -> do
+    hPutStrLn h "(set-logic ALL)"
+    hPutStrLn h $ "(include \"" ++ takeFileName (hdsBaseFile spec) ++ "\")"
+    forM_ files $ \(_, path) ->
+      hPutStrLn h $ "(include \"" ++ takeFileName path ++ "\")"
+
 mkAlphabetDomain :: Int -> Z3.Z3 AlphabetDomain
 mkAlphabetDomain n = do
-  sym <- Z3.mkStringSymbol "AlphabetSort"
   let size = max 1 n
-  sort <- Z3.mkFiniteDomainSort sym (fromIntegral size)
-  values <- V.generateM size $ \i -> Z3.mkInt i sort
+  (sort, values) <- mkEnumeratedDomain "AlphabetSort" "AlphabetValue" size
   pure AlphabetDomain { adSort = sort, adValues = values }
 
 mkStateDomain :: String -> Int -> Z3.Z3 StateDomain
 mkStateDomain label n = do
-  sym <- Z3.mkStringSymbol ("StateSort_" ++ label)
   let size = max 1 n
-  sort <- Z3.mkFiniteDomainSort sym (fromIntegral size)
-  values <- V.generateM size $ \i -> Z3.mkInt i sort
+      sortName = "StateSort_" ++ label
+      ctorPrefix = "StateValue_" ++ label
+  (sort, values) <- mkEnumeratedDomain sortName ctorPrefix size
   pure StateDomain { sdSort = sort, sdValues = values }
+
+mkEnumeratedDomain :: String -> String -> Int -> Z3.Z3 (Z3.Sort, V.Vector Z3.AST)
+mkEnumeratedDomain sortLabel ctorPrefix size = do
+  sortSym <- Z3.mkStringSymbol sortLabel
+  constructors <- forM [0 .. size - 1] $ \idx -> do
+    ctorSym <- Z3.mkStringSymbol (ctorPrefix ++ "_" ++ show idx)
+    testerSym <- Z3.mkStringSymbol (ctorPrefix ++ "_is_" ++ show idx)
+    Z3.mkConstructor ctorSym testerSym []
+  sort <- Z3.mkDatatype sortSym constructors
+  ctorDecls <- Z3.getDatatypeSortConstructors sort
+  let ctorVec = V.fromList ctorDecls
+  values <- V.generateM size $ \idx -> Z3.mkApp (ctorVec V.! idx) []
+  pure (sort, values)
 
 alphabetLiteral :: AlphabetDomain -> Int -> Z3.AST
 alphabetLiteral dom idx = adValues dom V.! idx
@@ -336,11 +444,12 @@ solvePuzzleZ3Direct encoding puzzle clues = do
     grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
     forM_ (zip clues stateCounts) $ \(clue, stateLimit) -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3 encoding alphabetDomain stateDomain stateLimit grid clue
+      applyClueZ3 solverSink encoding alphabetDomain stateDomain stateLimit grid clue
     liftIO (writeIORef stageRef "solverCheck")
     solveStart <- liftIO getCurrentTime
     (res, mModel) <- Z3.solverCheckAndGetModel
     solveEnd <- liftIO getCurrentTime
+    statsText <- Z3.solverGetStatistics
     case (res, mModel) of
       (Z3.Sat, Just model) -> do
         liftIO (writeIORef stageRef "extractModel")
@@ -349,23 +458,122 @@ solvePuzzleZ3Direct encoding puzzle clues = do
             liftIO (writeIORef stageRef ("extractModel cell " ++ show (xIdx, yIdx)))
             if abs (xIdx - yIdx) >= sideVal
               then pure 0
-              else extractCellValue model cell
-        pure (Just values, solveStart, solveEnd)
-      _ -> pure (Nothing, solveStart, solveEnd)
-    ) :: IO (Either SomeException (Maybe [[Word8]], UTCTime, UTCTime))
+              else extractCellValue alphabetDomain model cell
+        pure (Just values, solveStart, solveEnd, statsText)
+      _ -> pure (Nothing, solveStart, solveEnd, statsText)
+    ) :: IO (Either SomeException (Maybe [[Word8]], UTCTime, UTCTime, String))
   case resultOrErr of
     Left ex -> do
       stage <- readIORef stageRef
       pure (Left ("Z3 solver failed during " ++ stage ++ ": " ++ displayException ex))
-    Right (Nothing, _, _) -> pure (Left "Z3 solver reported UNSAT/UNKNOWN")
-    Right (Just modelVals, solveStart, solveEnd) -> do
+    Right (Nothing, _, _, statsStr) -> pure (Left ("Z3 solver reported UNSAT/UNKNOWN (stats: " ++ statsStr ++ ")"))
+    Right (Just modelVals, solveStart, solveEnd, statsStr) -> do
       let buildTime = toSeconds (diffUTCTime solveStart buildStart)
           solveTime = toSeconds (diffUTCTime solveEnd solveStart)
           rendered = renderGrid puzzle modelVals
-      pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime})
+      pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime, srStats = Just (T.pack statsStr)})
+
+-------------------------------------------------------------------------------
+-- Hot direct Z3 backend
+-------------------------------------------------------------------------------
+
+solvePuzzlesZ3DirectHotWithDump :: Maybe FilePath -> Int -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
+solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit encoding jobs = do
+  mSpec <- traverse mkHotDumpSpec dumpDir
+  results <- fmap concat $ mapM (solveChunk mSpec) (chunkList chunkLimit jobs)
+  case mSpec of
+    Just spec -> finalizeHotDump spec
+    Nothing -> pure ()
+  pure results
   where
-    toSeconds :: NominalDiffTime -> Double
-    toSeconds = realToFrac
+    solveChunk _ [] = pure []
+    solveChunk spec chunk@((firstPuzzle, _) : _)
+      | not (sameDimensions chunk && sameSides chunk) = mapM (uncurry (solvePuzzleZ3Direct encoding)) chunk
+      | otherwise = do
+          stageRef <- newIORef "initializing hot Z3"
+          resultOrErr <- (try $ Z3.evalZ3 $ do
+            alphabetDomain <- mkAlphabetDomain alphabetCardinality
+            stateDomain <- mkStateDomain "GlobalStateHot" (chunkStateCount chunk)
+            grid <- mkGridZ3 alphabetDomain (puzzleDiameter firstPuzzle)
+            maybeDumpBase spec
+            forM chunk $ \(puzzle, clues) -> do
+              liftIO (writeIORef stageRef ("puzzle " ++ show (puzzleDay puzzle)))
+              (sink, mHandle) <- buildLoggingSink spec puzzle solverSink
+              result <- Z3.local $ do
+                puzzleBuildStart <- liftIO getCurrentTime
+                forM_ clues $ \clue -> do
+                  let stateLimit = max 1 (V.length (diTransitions (clueDfa clue)))
+                  applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue
+                solveStart <- liftIO getCurrentTime
+                (res, mModel) <- Z3.solverCheckAndGetModel
+                solveEnd <- liftIO getCurrentTime
+                statsText <- Z3.solverGetStatistics
+                case (res, mModel) of
+                  (Z3.Sat, Just model) -> do
+                    values <- extractGridValues alphabetDomain puzzle grid model
+                    let buildTime = toSeconds (diffUTCTime solveStart puzzleBuildStart)
+                        solveTime = toSeconds (diffUTCTime solveEnd solveStart)
+                        rendered = renderGrid puzzle values
+                    pure $ Right
+                      SolveResult
+                        { srGrid = rendered
+                        , srBuildTime = buildTime
+                        , srSolveTime = solveTime
+                        , srStats = Just (T.pack statsText)
+                        }
+                  (Z3.Unsat, _) -> pure (Left "Z3 solver reported UNSAT")
+                  _ -> pure (Left "Z3 solver reported UNKNOWN")
+              liftIO $ finalizePuzzleLog mHandle (either id (const "sat") result)
+              pure result
+            ) :: IO (Either SomeException [Either String SolveResult])
+          case resultOrErr of
+            Left ex -> do
+              stage <- readIORef stageRef
+              pure (replicate (length chunk) (Left ("Z3 hot solver failed during " ++ stage ++ ": " ++ displayException ex)))
+            Right results' -> pure results'
+
+sameDimensions :: [(Puzzle, [Clue])] -> Bool
+sameDimensions chunk =
+  case chunk of
+    [] -> True
+    ((p0, _) : rest) -> all ((== puzzleDiameter p0) . puzzleDiameter . fst) rest
+
+sameSides :: [(Puzzle, [Clue])] -> Bool
+sameSides chunk =
+  case chunk of
+    [] -> True
+    ((p0, _) : rest) -> all ((== puzzleSide p0) . puzzleSide . fst) rest
+
+chunkStateCount :: [(Puzzle, [Clue])] -> Int
+chunkStateCount chunk =
+  let stateCounts = map (max 1 . V.length . diTransitions . clueDfa) (concatMap snd chunk)
+   in maximum (1 : stateCounts)
+
+solvePuzzlesZ3DirectHot :: Maybe FilePath -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
+solvePuzzlesZ3DirectHot dumpDir encoding jobs =
+  solvePuzzlesZ3DirectHotWithDump dumpDir maxHotBatchSize encoding jobs
+
+solvePuzzlesZ3DirectHotWithLimit :: Z3TransitionEncoding -> Int -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
+solvePuzzlesZ3DirectHotWithLimit encoding chunkLimit jobs =
+  solvePuzzlesZ3DirectHotWithDump Nothing chunkLimit encoding jobs
+
+solvePuzzlesZ3DirectHotNoChunk :: Maybe FilePath -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
+solvePuzzlesZ3DirectHotNoChunk dumpDir encoding jobs =
+  solvePuzzlesZ3DirectHotWithDump dumpDir 0 encoding jobs
+
+maxHotBatchSize :: Int
+maxHotBatchSize = 5
+
+chunkList :: Int -> [a] -> [[a]]
+chunkList _ [] = []
+chunkList n xs
+  | n <= 0 = [xs]
+  | otherwise = go xs
+  where
+    go [] = []
+    go ys =
+      let (prefix, rest) = splitAt n ys
+       in prefix : go rest
 
 mkGridZ3 :: AlphabetDomain -> Int -> Z3.Z3 [[Z3.AST]]
 mkGridZ3 alphabetDomain dim =
@@ -373,8 +581,8 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3 :: Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3 encoding alphabetDomain stateDomain stateLimit grid clue = do
+applyClueZ3 :: ConstraintSink -> Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       dfaInfo = clueDfa clue
       deadStates = diDeadStates dfaInfo
@@ -384,22 +592,22 @@ applyClueZ3 encoding alphabetDomain stateDomain stateLimit grid clue = do
          in if V.null vec then IntSet.empty else vec V.! diInitial dfaInfo
   transitionFn <- buildTransitionFunction encoding stateDomain alphabetDomain dfaInfo
   states <- mkStateVarsZ3 stateDomain (length chars) (clueAxis clue) (clueIndex clue)
-  restrictStatesZ3 stateDomain stateLimit deadStates states
-  mapM_ (restrictAlphabetZ3 alphabetDomain deadAlphabet) chars
+  restrictStatesZ3 sink stateDomain stateLimit deadStates states
+  mapM_ (restrictAlphabetZ3 sink alphabetDomain deadAlphabet) chars
   case (states, chars) of
     (st0 : _, firstChar : _) -> do
-      restrictAlphabetZ3 alphabetDomain initialDead firstChar
+      restrictAlphabetZ3 sink alphabetDomain initialDead firstChar
       let initLit = stateLiteral stateDomain (diInitial dfaInfo)
       eq <- Z3.mkEq st0 initLit
-      Z3.assert eq
+      csEmit sink eq
     (st0 : _, []) -> do
       let initLit = stateLiteral stateDomain (diInitial dfaInfo)
       eq <- Z3.mkEq st0 initLit
-      Z3.assert eq
+      csEmit sink eq
     _ -> pure ()
-  applyTransitionsZ3 transitionFn states chars
+  applyTransitionsZ3 sink transitionFn states chars
   case lastMaybe states of
-    Just finalState -> assertAcceptStateZ3 stateDomain dfaInfo finalState
+    Just finalState -> assertAcceptStateZ3 sink stateDomain dfaInfo finalState
     Nothing -> pure ()
 
 mkStateVarsZ3 :: StateDomain -> Int -> Char -> Int -> Z3.Z3 [Z3.AST]
@@ -407,8 +615,8 @@ mkStateVarsZ3 stateDomain len axis idx =
   forM [0 .. len] $ \i ->
     Z3.mkFreshConst ("state_" ++ [axis] ++ "_" ++ show idx ++ "_" ++ show i) (sdSort stateDomain)
 
-restrictStatesZ3 :: StateDomain -> Int -> IntSet.IntSet -> [Z3.AST] -> Z3.Z3 ()
-restrictStatesZ3 stateDomain stateLimit deadStates states = do
+restrictStatesZ3 :: ConstraintSink -> StateDomain -> Int -> IntSet.IntSet -> [Z3.AST] -> Z3.Z3 ()
+restrictStatesZ3 sink stateDomain stateLimit deadStates states = do
   let domainSize = V.length (sdValues stateDomain)
       bannedDead = [ stateLiteral stateDomain idx
                    | idx <- IntSet.toList deadStates
@@ -423,38 +631,38 @@ restrictStatesZ3 stateDomain stateLimit deadStates states = do
     forM_ bannedLits $ \bad -> do
       eq <- Z3.mkEq st bad
       neq <- Z3.mkNot eq
-      Z3.assert neq
+      csEmit sink neq
 
-restrictAlphabetZ3 :: AlphabetDomain -> IntSet.IntSet -> Z3.AST -> Z3.Z3 ()
-restrictAlphabetZ3 alphabetDomain banned cell =
+restrictAlphabetZ3 :: ConstraintSink -> AlphabetDomain -> IntSet.IntSet -> Z3.AST -> Z3.Z3 ()
+restrictAlphabetZ3 sink alphabetDomain banned cell =
   forM_ (IntSet.toList banned) $ \idx -> do
     let idxLit = alphabetLiteral alphabetDomain idx
     eq <- Z3.mkEq cell idxLit
     neq <- Z3.mkNot eq
-    Z3.assert neq
+    csEmit sink neq
 
-applyTransitionsZ3 :: TransitionFunction -> [Z3.AST] -> [Z3.AST] -> Z3.Z3 ()
-applyTransitionsZ3 _ _ [] = pure ()
-applyTransitionsZ3 _ [_] _ = pure ()
-applyTransitionsZ3 transFn (prev:next:restStates) (ch:chs) = do
+applyTransitionsZ3 :: ConstraintSink -> TransitionFunction -> [Z3.AST] -> [Z3.AST] -> Z3.Z3 ()
+applyTransitionsZ3 _ _ _ [] = pure ()
+applyTransitionsZ3 _ _ [_] _ = pure ()
+applyTransitionsZ3 sink transFn (prev:next:restStates) (ch:chs) = do
   expected <- applyTransitionFunction transFn prev ch
   eq <- Z3.mkEq next expected
-  Z3.assert eq
-  applyTransitionsZ3 transFn (next:restStates) chs
-applyTransitionsZ3 _ _ _ = pure ()
+  csEmit sink eq
+  applyTransitionsZ3 sink transFn (next:restStates) chs
+applyTransitionsZ3 _ _ _ _ = pure ()
 
-assertAcceptStateZ3 :: StateDomain -> DfaInfo -> Z3.AST -> Z3.Z3 ()
-assertAcceptStateZ3 stateDomain info finalState =
+assertAcceptStateZ3 :: ConstraintSink -> StateDomain -> DfaInfo -> Z3.AST -> Z3.Z3 ()
+assertAcceptStateZ3 sink stateDomain info finalState =
   case IntSet.toList (diAccepting info) of
     [] -> do
       falseNode <- Z3.mkFalse
-      Z3.assert falseNode
+      csEmit sink falseNode
     xs -> do
       comparisons <- forM xs $ \v -> do
         let lit = stateLiteral stateDomain v
         Z3.mkEq finalState lit
       cond <- Z3.mkOr comparisons
-      Z3.assert cond
+      csEmit sink cond
 
 transitionLookupZ3 :: StateDomain -> AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
 transitionLookupZ3 stateDomain alphabetDomain info st ch = do
@@ -521,18 +729,30 @@ clueLabel clue =
       prefix = [clueAxis clue] ++ show (clueIndex clue)
    in prefix ++ if null patternPreview then "" else " " ++ patternPreview
 
-extractCellValue :: Z3.Model -> Z3.AST -> Z3.Z3 Word8
-extractCellValue model cell = do
+extractCellValue :: AlphabetDomain -> Z3.Model -> Z3.AST -> Z3.Z3 Word8
+extractCellValue alphabetDomain model cell = do
   mVal <- Z3.modelEval model cell True
   case mVal of
     Nothing -> liftIO (ioError (userError "Z3 model missing cell value"))
-    Just ast -> do
-      numStr <- Z3.getNumeralString ast
-      case readMaybe numStr of
-        Just n | n >= 0 && n <= 255 -> pure (fromIntegral (n :: Integer))
-        _ -> do
-          rendered <- Z3.astToString ast
-          liftIO (ioError (userError ("Unexpected Z3 numeral: " ++ rendered ++ " (" ++ numStr ++ ")")))
+    Just ast -> matchLiteral 0 (V.toList (adValues alphabetDomain)) ast
+  where
+    matchLiteral :: Int -> [Z3.AST] -> Z3.AST -> Z3.Z3 Word8
+    matchLiteral _ [] badAst = do
+      rendered <- Z3.astToString badAst
+      liftIO (ioError (userError ("Unexpected alphabet literal: " ++ rendered)))
+    matchLiteral idx (lit:lits) candidate = do
+      same <- Z3.isEqAST candidate lit
+      if same
+        then pure (fromIntegral idx :: Word8)
+        else matchLiteral (idx + 1) lits candidate
+
+extractGridValues :: AlphabetDomain -> Puzzle -> [[Z3.AST]] -> Z3.Model -> Z3.Z3 [[Word8]]
+extractGridValues alphabetDomain puzzle grid model =
+  forM (zip [0 :: Int ..] grid) $ \(xIdx, row) ->
+    forM (zip [0 :: Int ..] row) $ \(yIdx, cell) ->
+      if abs (xIdx - yIdx) >= puzzleSide puzzle
+        then pure 0
+        else extractCellValue alphabetDomain model cell
 
 -------------------------------------------------------------------------------
 -- Shared helpers
