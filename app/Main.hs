@@ -2,7 +2,7 @@
 
 module Main (main) where
 
-import Control.Monad (forM)
+import Control.Monad (forM, forM_, when)
 import qualified Data.Map.Strict as Map
 import Data.Aeson (ToJSON, Value (Null), encode, object, (.=), toJSON)
 import qualified Data.Aeson.Key as Key
@@ -29,6 +29,8 @@ import Regexle.Solver
   , solvePuzzleWith
   , solvePuzzleWithClues
   , solvePuzzlesHot
+  , solvePuzzlesZ3DirectHotNoChunk
+  , solvePuzzlesZ3DirectHotWithLimit
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
@@ -40,11 +42,13 @@ main = do
     CmdFetch fetchOpts -> runFetch fetchOpts
     CmdMatrix matrixOpts -> runMatrix matrixOpts
     CmdProfile profileOpts -> runProfile profileOpts
+    CmdReproHot reproOpts -> runReproHot reproOpts
 
 data Command
   = CmdFetch FetchOptions
   | CmdMatrix MatrixOptions
   | CmdProfile ProfileOptions
+  | CmdReproHot ReproOptions
   deriving (Show)
 
 data FetchOptions = FetchOptions
@@ -72,6 +76,13 @@ data ProfileOptions = ProfileOptions
   , poHotSolver :: !Bool
   , poStrategy :: !SolverStrategy
   , poOutput :: !FilePath
+  }
+  deriving (Show)
+
+data ReproOptions = ReproOptions
+  { roSide :: !Int
+  , roDays :: ![Int]
+  , roChunkSize :: !Int
   }
   deriving (Show)
 
@@ -103,6 +114,12 @@ commandParser =
           ( info
               (CmdProfile <$> profileOptionsParser)
               (progDesc "Aggregate benchmark stats for a range of puzzle days")
+          )
+        <> command
+          "repro-hot"
+          ( info
+              (CmdReproHot <$> reproOptionsParser)
+              (progDesc "Directly exercise the hot Z3 solver on a custom day range (debug helper)")
           )
     )
 
@@ -188,6 +205,34 @@ profileOptionsParser =
           <> value "stats/profile.json"
       )
 
+reproOptionsParser :: Parser ReproOptions
+reproOptionsParser =
+  ReproOptions
+    <$> option
+      auto
+      ( long "side"
+          <> metavar "INT"
+          <> help "Puzzle side length"
+          <> showDefault
+          <> value 3
+      )
+    <*> option
+      (eitherReader parseRangeSpec)
+      ( long "days"
+          <> metavar "SPEC"
+          <> help "Day list (e.g. 30..35)"
+          <> showDefaultWith (const "30..35")
+          <> value [30 .. 35]
+      )
+    <*> option
+      auto
+      ( long "chunk-size"
+          <> metavar "INT"
+          <> help "Maximum puzzles per hot batch (<=0 disables chunking)"
+          <> showDefault
+          <> value 0
+      )
+
 runFetch :: FetchOptions -> IO ()
 runFetch FetchOptions {foDay = day, foSide = side} = do
   puzzle <- fetchPuzzle day side
@@ -214,6 +259,41 @@ runMatrix MatrixOptions { moSides = sides
       <> show (length entries)
       <> " rows to "
       <> outputPath
+
+runReproHot :: ReproOptions -> IO ()
+runReproHot ReproOptions { roSide = side
+                         , roDays = days
+                         , roChunkSize = chunkSize
+                         } = do
+  when (null days) $ fail "repro-hot: no days provided"
+  putStrLn $ "Fetching " <> show (length days) <> " puzzles"
+  puzzlesWithClues <- forM days $ \day -> do
+    puzzle <- fetchPuzzle day side
+    case buildClues puzzle of
+      Left err -> fail ("Failed to build clues for day " <> show day <> ": " <> err)
+      Right clues -> pure (puzzle, clues)
+
+  let solveCfg = defaultSolveConfig { scBackend = BackendZ3Direct }
+      encoding = scZ3TransitionEncoding solveCfg
+      runAction
+        | chunkSize <= 0 = solvePuzzlesZ3DirectHotNoChunk encoding puzzlesWithClues
+        | otherwise = solvePuzzlesZ3DirectHotWithLimit encoding chunkSize puzzlesWithClues
+
+  putStrLn $ "Invoking hot solver with chunk size = " <> show chunkSize
+  results <- runAction
+  forM_ (zip days results) $ \(day, outcome) ->
+    case outcome of
+      Left err ->
+        putStrLn $ "Day " <> show day <> ": ERROR - " <> err
+      Right SolveResult { srBuildTime = buildT, srSolveTime = solveT } ->
+        putStrLn $
+          "Day "
+            <> show day
+            <> ": build="
+            <> show buildT
+            <> "s solve="
+            <> show solveT
+            <> "s"
 
 data StrategySpec = StrategySpec
   { ssName :: !String
@@ -276,7 +356,11 @@ matrixEntry puzzle spec = do
                  , "z3_stats" .= object []
                  ]
           )
-    Right SolveResult { srBuildTime = buildTime, srSolveTime = solveTime, srGrid = gridLines } ->
+    Right SolveResult { srBuildTime = buildTime
+                      , srSolveTime = solveTime
+                      , srGrid = gridLines
+                      , srStats = statsTxt
+                      } ->
       pure $
         object
           ( baseFields
@@ -284,9 +368,12 @@ matrixEntry puzzle spec = do
                  , "solve_time" .= solveTime
                  , "total_time" .= (buildTime + solveTime)
                  , "solution" .= map T.pack gridLines
-                 , "z3_stats" .= object []
+                 , "z3_stats" .= statsValue statsTxt
                  ]
           )
+  where
+    statsValue Nothing = object []
+    statsValue (Just txt) = object ["raw" .= txt]
 
 runProfile :: ProfileOptions -> IO ()
 runProfile ProfileOptions { poSide = side
@@ -364,7 +451,11 @@ runProfile ProfileOptions { poSide = side
                     , prStrategyConfig = strategyConfigValue
                     , prZ3Stats = object []
                     }
-                Just (Right SolveResult { srBuildTime = buildTime, srSolveTime = solveTime, srGrid = gridLines }) ->
+                Just (Right SolveResult { srBuildTime = buildTime
+                                         , srSolveTime = solveTime
+                                         , srGrid = gridLines
+                                         , srStats = statsTxt
+                                         }) ->
                   ProfileRow
                     { prSide = side
                     , prDay = day
@@ -375,7 +466,7 @@ runProfile ProfileOptions { poSide = side
                     , prError = Nothing
                     , prStrategy = strategyNameText
                     , prStrategyConfig = strategyConfigValue
-                    , prZ3Stats = object []
+                    , prZ3Stats = statsValue statsTxt
                     }
         | (day, entry) <- puzzleEntries
         ]
@@ -417,6 +508,10 @@ runProfile ProfileOptions { poSide = side
 
     displayMaybe :: Maybe Double -> String
     displayMaybe = maybe "n/a" show
+
+    statsValue :: Maybe T.Text -> Value
+    statsValue Nothing = object []
+    statsValue (Just txt) = object ["raw" .= txt]
 
 data ProfileRow = ProfileRow
   { prSide :: !Int
