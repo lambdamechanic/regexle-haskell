@@ -96,3 +96,11 @@ Then use `mcp__beads__*` functions instead of CLI commands.
 - ❌ Do NOT duplicate tracking systems
 
 For more details, see README.md and QUICKSTART.md.
+
+### Git Remotes
+
+- When working with `lambdamechanic/*` forks, always use SSH so the existing agent handles auth:
+  ```bash
+  git remote set-url origin git@github.com:lambdamechanic/<repo>.git
+  ```
+- If you encounter an HTTPS `lambdamechanic` remote, rewrite it to the SSH form before pushing.
