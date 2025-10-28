@@ -5,3 +5,5 @@ cabal.project.local
 .stack-work/
 kleene-0.1/
 stats/
+.beads/issues.jsonl
+.beads/daemon.*

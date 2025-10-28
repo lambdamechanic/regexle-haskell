@@ -83,6 +83,7 @@ data ReproOptions = ReproOptions
   , roDays :: ![Int]
   , roChunkSize :: !Int
   , roDumpDir :: !(Maybe FilePath)
+  , roDumpOnly :: !Bool
   }
   deriving (Show)
 
@@ -239,6 +240,10 @@ reproOptionsParser =
               <> help "Optional directory to dump SMT2 files and driver"
           )
       )
+    <*> switch
+      ( long "dump-only"
+          <> help "Skip solving; only dump SMT2 constraints"
+      )
 
 runFetch :: FetchOptions -> IO ()
 runFetch FetchOptions {foDay = day, foSide = side} = do
@@ -272,8 +277,11 @@ runReproHot ReproOptions { roSide = side
                          , roDays = days
                          , roChunkSize = chunkSize
                          , roDumpDir = dumpDir
+                         , roDumpOnly = dumpOnly
                          } = do
   when (null days) $ fail "repro-hot: no days provided"
+  when (dumpOnly && dumpDir == Nothing) $
+    fail "--dump-only requires --dump-dir"
   putStrLn $ "Fetching " <> show (length days) <> " puzzles"
   puzzlesWithClues <- forM days $ \day -> do
     puzzle <- fetchPuzzle day side
@@ -283,7 +291,7 @@ runReproHot ReproOptions { roSide = side
 
   let solveCfg = defaultSolveConfig { scBackend = BackendZ3Direct }
       encoding = scZ3TransitionEncoding solveCfg
-      runAction = solvePuzzlesZ3DirectHotWithDump dumpDir chunkSize encoding puzzlesWithClues
+      runAction = solvePuzzlesZ3DirectHotWithDump dumpDir chunkSize dumpOnly encoding puzzlesWithClues
 
   putStrLn $ "Invoking hot solver with chunk size = " <> show chunkSize
   results <- runAction

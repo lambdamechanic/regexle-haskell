@@ -91,3 +91,20 @@ executable regexle-haskell
 
     hs-source-dirs:   app
     default-language: Haskell2010
+
+executable replay-dump
+    import:           warnings
+    main-is:          ReplayDump.hs
+    build-depends:
+        base >=4.19 && <5,
+        containers >=0.7 && <0.8,
+        directory >=1.3 && <1.4,
+        filepath >=1.4 && <1.5,
+        optparse-applicative >=0.18 && <0.19,
+        mtl >=2.3 && <2.4,
+        transformers >=0.6 && <0.7,
+        text >=2.0 && <2.3,
+        regexle-haskell,
+        z3 >=408 && <409
+    hs-source-dirs:   app
+    default-language: Haskell2010
