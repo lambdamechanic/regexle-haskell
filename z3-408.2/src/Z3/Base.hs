@@ -80,6 +80,9 @@ module Z3.Base (
   , mkConfig
   , delConfig
   , setParamValue
+  , globalParamSet
+  , globalParamGet
+  , globalParamResetAll
   -- ** Helpers
   , withConfig
 
@@ -481,6 +484,7 @@ module Z3.Base (
   , solverGetUnsatCore
   , solverGetReasonUnknown
   , solverToString
+  , solverGetStatistics
   -- ** Helpers
   , solverCheckAndGetModel
   ) where
@@ -637,9 +641,31 @@ data ASTKind
 ---------------------------------------------------------------------
 -- * Configuration
 
--- TODO: Z3_global_param_set
--- TODO: Z3_global_param_reset_all
--- TODO: Z3_global_param_get
+-- | Set a global parameter.
+--
+-- Corresponds to 'Z3_global_param_set'.
+globalParamSet :: String -> String -> IO ()
+globalParamSet key val =
+  withCString key $ \keyPtr ->
+    withCString val $ \valPtr ->
+      z3_global_param_set keyPtr valPtr
+
+-- | Reset all global parameters to their default values.
+--
+-- Corresponds to 'Z3_global_param_reset_all'.
+globalParamResetAll :: IO ()
+globalParamResetAll = z3_global_param_reset_all
+
+-- | Retrieve the current value of a global parameter, if any.
+--
+-- Corresponds to 'Z3_global_param_get'.
+globalParamGet :: String -> IO (Maybe String)
+globalParamGet key =
+  withCString key $ \keyPtr -> do
+    resPtr <- z3_global_param_get keyPtr
+    if resPtr == nullPtr
+      then return Nothing
+      else Just <$> peekCString resPtr
 
 ---------------------------------------------------------------------
 -- * Create configuration
@@ -3181,6 +3207,17 @@ solverGetReasonUnknown = liftFun1 z3_solver_get_reason_unknown
 -- | Convert the given solver into a string.
 solverToString :: Context -> Solver -> IO String
 solverToString = liftFun1 z3_solver_to_string
+
+solverGetStatistics :: Context -> Solver -> IO String
+solverGetStatistics ctx solver =
+  withContextError ctx $ \ctxPtr ->
+    h2c solver $ \solverPtr ->
+      bracket
+        (checkError ctxPtr $ z3_solver_get_statistics ctxPtr solverPtr)
+        (z3_stats_dec_ref ctxPtr)
+        (\statsPtr -> do
+            statsStr <- z3_stats_to_string ctxPtr statsPtr
+            peekCString statsStr)
 
 -------------------------------------------------
 -- ** Helpers

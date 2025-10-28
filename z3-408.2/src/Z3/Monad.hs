@@ -51,6 +51,9 @@ module Z3.Monad
   , paramsSetDouble
   , paramsSetSymbol
   , paramsToString
+  , globalParamSet
+  , globalParamGet
+  , globalParamResetAll
 
   -- * Symbols
   , mkIntSymbol
@@ -434,6 +437,7 @@ module Z3.Monad
   , solverGetUnsatCore
   , solverGetReasonUnknown
   , solverToString
+  , solverGetStatistics
   -- ** Helpers
   , assert
   , check
@@ -692,6 +696,18 @@ paramsSetSymbol = liftFun3 Base.paramsSetSymbol
 -- This function is mainly used for printing the contents of a parameter set.
 paramsToString :: MonadZ3 z3 => Params -> z3 String
 paramsToString = liftFun1 Base.paramsToString
+
+-- | Set a global parameter.
+globalParamSet :: MonadZ3 z3 => String -> String -> z3 ()
+globalParamSet key val = liftIO (Base.globalParamSet key val)
+
+-- | Reset all global parameters to their defaults.
+globalParamResetAll :: MonadZ3 z3 => z3 ()
+globalParamResetAll = liftIO Base.globalParamResetAll
+
+-- | Retrieve the value of a global parameter, if set.
+globalParamGet :: MonadZ3 z3 => String -> z3 (Maybe String)
+globalParamGet key = liftIO (Base.globalParamGet key)
 
 -- TODO: Z3_params_validate
 
@@ -2479,6 +2495,9 @@ solverGetReasonUnknown = liftSolver0 Base.solverGetReasonUnknown
 -- | Convert the given solver into a string.
 solverToString :: MonadZ3 z3 => z3 String
 solverToString = liftSolver0 Base.solverToString
+
+solverGetStatistics :: MonadZ3 z3 => z3 String
+solverGetStatistics = liftSolver0 Base.solverGetStatistics
 
 -------------------------------------------------
 -- ** Helpers

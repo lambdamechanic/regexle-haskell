@@ -19,11 +19,13 @@ module Regexle.Solver
   , HotDumpSpec (..)
   , hotDumpBaseFile
   , hotDumpPuzzleFile
+  , enableZ3ConsistencyChecks
   ) where
 
 import Control.Exception (SomeException, displayException, finally, try)
-import Control.Monad (foldM, forM, forM_)
+import Control.Monad (foldM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
+import Data.Char (toLower)
 import qualified Data.IntSet as IntSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
@@ -68,8 +70,19 @@ import Regexle.PuzzleCache
 import Regexle.RegexParser (parseRegexToERE)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>), takeFileName)
-import System.IO (Handle, IOMode (WriteMode), hClose, hPutStrLn, openFile)
+import System.IO
+  ( BufferMode (NoBuffering)
+  , Handle
+  , IOMode (WriteMode)
+  , hClose
+  , hFlush
+  , hPutStrLn
+  , hSetBuffering
+  , openFile
+  )
 import Text.Printf (printf)
+import qualified Z3.Base as Z3Base
+import System.Environment (lookupEnv)
 
 -------------------------------------------------------------------------------
 -- Types and configuration
@@ -100,6 +113,18 @@ defaultSolveConfig =
     , scTransitionEncoding = UseLambda
     , scZ3TransitionEncoding = Z3TransitionLambda
     }
+
+enableZ3ConsistencyChecks :: IO ()
+enableZ3ConsistencyChecks = do
+  flag <- lookupEnv "REGEXLE_Z3_CHECKS"
+  Z3Base.globalParamResetAll
+  let enabled =
+        case fmap (map toLower) flag of
+          Just val | val `elem` ["0", "false", "off", "no"] -> False
+          _ -> True
+  when enabled $ do
+    -- Turn on Z3 reference-count consistency checks so we get a trapped failure instead of a segfault.
+    Z3Base.globalParamSet "debug_ref_count" "true"
 
 -------------------------------------------------------------------------------
 -- Solver-facing types
@@ -335,6 +360,12 @@ data HotDumpSpec = HotDumpSpec
   , hdsPuzzleFiles :: !(IORef [(Int, FilePath)])
   }
 
+data PuzzleLogTarget = PuzzleLogTarget
+  { pltHandle :: !Handle
+  , pltPath :: !FilePath
+  , pltEvalBuffer :: !(IORef [String])
+  }
+
 hotDumpBaseFile :: HotDumpSpec -> FilePath
 hotDumpBaseFile = hdsBaseFile
 
@@ -423,36 +454,52 @@ mkHotBaseSignature alphabetDomain stateDomain grid =
     , hbsGridDim = length grid
     }
 
-buildLoggingSink :: Maybe HotDumpSpec -> Puzzle -> ConstraintSink -> Z3.Z3 (ConstraintSink, Maybe (Handle, FilePath))
+buildLoggingSink :: Maybe HotDumpSpec -> Puzzle -> ConstraintSink -> Z3.Z3 (ConstraintSink, Maybe PuzzleLogTarget)
 buildLoggingSink Nothing _ sink = pure (sink, Nothing)
 buildLoggingSink (Just spec) puzzle sink = do
   let path = hotDumpPuzzleFile spec (puzzleDay puzzle)
   handle <- liftIO $ openFile path WriteMode
+  liftIO $ hSetBuffering handle NoBuffering
+  evalRef <- liftIO $ newIORef []
   liftIO $ do
     hPutStrLn handle $ printf "; puzzle %d" (puzzleDay puzzle)
     hPutStrLn handle "(push)"
-    recordPuzzleDump spec (puzzleDay puzzle) path
+  liftIO $ recordPuzzleDump spec (puzzleDay puzzle) path
+  let target = PuzzleLogTarget
+        { pltHandle = handle
+        , pltPath = path
+        , pltEvalBuffer = evalRef
+        }
   let loggingSink = ConstraintSink
         { csEmit = \ast -> do
             csEmit sink ast
             rendered <- Z3.astToString ast
-            liftIO $ hPutStrLn handle ("(assert " ++ rendered ++ ")")
-        , csDeclare = \ast -> do
-            declStr <- Z3.astToString ast
-            sort <- Z3.getSort ast
-            sortStr <- Z3.sortToString sort
-            liftIO $ hPutStrLn handle ("(declare-const " ++ declStr ++ " " ++ sortStr ++ ")")
-        }
-  pure (loggingSink, Just (handle, path))
+            liftIO $ hPutStrLn (pltHandle target) ("(assert " ++ rendered ++ ")")
+          , csDeclare = \ast -> do
+              declStr <- Z3.astToString ast
+              sort <- Z3.getSort ast
+              sortStr <- Z3.sortToString sort
+              liftIO $ hPutStrLn (pltHandle target) ("(declare-const " ++ declStr ++ " " ++ sortStr ++ ")")
+          }
+  pure (loggingSink, Just target)
 
-finalizePuzzleLog :: Maybe HotDumpSpec -> Maybe (Handle, FilePath) -> String -> IO ()
+finalizePuzzleLog :: Maybe HotDumpSpec -> Maybe PuzzleLogTarget -> String -> IO ()
 finalizePuzzleLog _ Nothing _ = pure ()
-finalizePuzzleLog mSpec (Just (handle, path)) comment = do
+finalizePuzzleLog mSpec (Just target) comment = do
+  let handle = pltHandle target
   hPutStrLn handle "(check-sat)"
+  hPutStrLn handle "(get-model)"
+  flushEvalBuffer target
   hPutStrLn handle $ "; result: " ++ comment
   hPutStrLn handle "(pop)"
+  hFlush handle
   hClose handle
-  forM_ mSpec $ \spec -> appendDriver spec path
+  forM_ mSpec $ \spec -> appendDriver spec (pltPath target)
+
+flushEvalBuffer :: PuzzleLogTarget -> IO ()
+flushEvalBuffer target = do
+  cmds <- readIORef (pltEvalBuffer target)
+  mapM_ (hPutStrLn (pltHandle target)) (reverse cmds)
 
 finalizeHotDump :: HotDumpSpec -> IO ()
 finalizeHotDump _ = pure ()
@@ -498,8 +545,8 @@ solvePuzzleZ3Direct :: Z3TransitionEncoding -> Puzzle -> [Clue] -> IO (Either St
 solvePuzzleZ3Direct encoding puzzle clues = do
   buildStart <- getCurrentTime
   stageRef <- newIORef "initializing"
-  let sideVal = puzzleSide puzzle
-      stateCounts = map (max 1 . V.length . diTransitions . clueDfa) clues
+  enableZ3ConsistencyChecks
+  let stateCounts = map (max 1 . V.length . diTransitions . clueDfa) clues
       globalStateCount = maximum (1 : stateCounts)
   resultOrErr <- (try $ Z3.evalZ3 $ do
     alphabetDomain <- mkAlphabetDomain alphabetCardinality
@@ -517,12 +564,7 @@ solvePuzzleZ3Direct encoding puzzle clues = do
     case (res, mModel) of
       (Z3.Sat, Just model) -> do
         liftIO (writeIORef stageRef "extractModel")
-        values <- forM (zip [0 :: Int ..] grid) $ \(xIdx, row) ->
-          forM (zip [0 :: Int ..] row) $ \(yIdx, cell) -> do
-            liftIO (writeIORef stageRef ("extractModel cell " ++ show (xIdx, yIdx)))
-            if abs (xIdx - yIdx) >= sideVal
-              then pure 0
-              else extractCellValue alphabetDomain model cell
+        values <- extractGridValues Nothing alphabetDomain puzzle grid model
         pure (Just values, solveStart, solveEnd, statsText)
       _ -> pure (Nothing, solveStart, solveEnd, statsText)
     ) :: IO (Either SomeException (Maybe [[Word8]], UTCTime, UTCTime, String))
@@ -543,6 +585,7 @@ solvePuzzleZ3Direct encoding puzzle clues = do
 
 solvePuzzlesZ3DirectHotWithDump :: Maybe FilePath -> Int -> Bool -> Z3TransitionEncoding -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit dryRun encoding jobs = do
+  enableZ3ConsistencyChecks
   mSpec <- traverse mkHotDumpSpec dumpDir
   let runChunks = fmap concat $ mapM (solveChunk mSpec) (chunkList chunkLimit jobs)
   case mSpec of
@@ -580,7 +623,7 @@ solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit dryRun encoding jobs = do
                     statsText <- Z3.solverGetStatistics
                     case (res, mModel) of
                       (Z3.Sat, Just model) -> do
-                        values <- extractGridValues alphabetDomain puzzle grid model
+                        values <- extractGridValues (fmap pltEvalBuffer mHandle) alphabetDomain puzzle grid model
                         let buildTime = toSeconds (diffUTCTime solveStart puzzleBuildStart)
                             solveTime = toSeconds (diffUTCTime solveEnd solveStart)
                             rendered = renderGrid puzzle values
@@ -802,8 +845,11 @@ clueLabel clue =
       prefix = [clueAxis clue] ++ show (clueIndex clue)
    in prefix ++ if null patternPreview then "" else " " ++ patternPreview
 
-extractCellValue :: AlphabetDomain -> Z3.Model -> Z3.AST -> Z3.Z3 Word8
-extractCellValue alphabetDomain model cell = do
+extractCellValue :: Maybe (IORef [String]) -> AlphabetDomain -> Z3.Model -> Z3.AST -> Z3.Z3 Word8
+extractCellValue mEvalLog alphabetDomain model cell = do
+  forM_ mEvalLog $ \ref -> do
+    cellStr <- Z3.astToString cell
+    liftIO $ modifyIORef' ref ( ("(get-value (" ++ cellStr ++ "))") : )
   mVal <- Z3.modelEval model cell True
   case mVal of
     Nothing -> liftIO (ioError (userError "Z3 model missing cell value"))
@@ -819,13 +865,13 @@ extractCellValue alphabetDomain model cell = do
         then pure (fromIntegral idx :: Word8)
         else matchLiteral (idx + 1) lits candidate
 
-extractGridValues :: AlphabetDomain -> Puzzle -> [[Z3.AST]] -> Z3.Model -> Z3.Z3 [[Word8]]
-extractGridValues alphabetDomain puzzle grid model =
+extractGridValues :: Maybe (IORef [String]) -> AlphabetDomain -> Puzzle -> [[Z3.AST]] -> Z3.Model -> Z3.Z3 [[Word8]]
+extractGridValues mEvalLog alphabetDomain puzzle grid model =
   forM (zip [0 :: Int ..] grid) $ \(xIdx, row) ->
     forM (zip [0 :: Int ..] row) $ \(yIdx, cell) ->
       if abs (xIdx - yIdx) >= puzzleSide puzzle
         then pure 0
-        else extractCellValue alphabetDomain model cell
+        else extractCellValue mEvalLog alphabetDomain model cell
 
 -------------------------------------------------------------------------------
 -- Shared helpers

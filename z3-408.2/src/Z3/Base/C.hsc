@@ -72,6 +72,8 @@ data Z3_optimize
 
 data Z3_solver
 
+data Z3_stats
+
 data Z3_params
 
 data Z3_ast_vector
@@ -188,6 +190,18 @@ foreign import ccall unsafe "Z3_del_config"
 -- | Reference: <http://z3prover.github.io/api/html/group__capi.html#ga001ade87a1671fe77d7e53ed0f4f1ec3>
 foreign import ccall unsafe "Z3_set_param_value"
     z3_set_param_value :: Ptr Z3_config -> Z3_string -> Z3_string -> IO ()
+
+-- | Reference: <http://z3prover.github.io/api/html/group__capi.html#gaedddffbacdd99075829c5cf5deb5c61a>
+foreign import ccall unsafe "Z3_global_param_set"
+    z3_global_param_set :: Z3_string -> Z3_string -> IO ()
+
+-- | Reference: <http://z3prover.github.io/api/html/group__capi.html#gaadcb2471653d263c49c495858da4b325>
+foreign import ccall unsafe "Z3_global_param_reset_all"
+    z3_global_param_reset_all :: IO ()
+
+-- | Reference: <http://z3prover.github.io/api/html/group__capi.html#gaa24a24965f0b16331d21b74d0f00869d>
+foreign import ccall unsafe "Z3_global_param_get"
+    z3_global_param_get :: Z3_string -> IO Z3_string
 
 
 ---------------------------------------------------------------------
@@ -1446,6 +1460,15 @@ foreign import ccall unsafe "Z3_mk_solver_for_logic"
 -- | Reference: <http://z3prover.github.io/api/html/group__capi.html#ga047bb9dff9d57c7d3a71b7af4555956b>
 foreign import ccall unsafe "Z3_solver_get_help"
     z3_solver_get_help :: Ptr Z3_context -> Ptr Z3_solver -> IO Z3_string
+
+foreign import ccall unsafe "Z3_solver_get_statistics"
+    z3_solver_get_statistics :: Ptr Z3_context -> Ptr Z3_solver -> IO (Ptr Z3_stats)
+
+foreign import ccall unsafe "Z3_stats_to_string"
+    z3_stats_to_string :: Ptr Z3_context -> Ptr Z3_stats -> IO Z3_string
+
+foreign import ccall unsafe "Z3_stats_dec_ref"
+    z3_stats_dec_ref :: Ptr Z3_context -> Ptr Z3_stats -> IO ()
 
 -- | Reference: <http://z3prover.github.io/api/html/group__capi.html#ga887441b3468a1bc605bbf564ddebf2ae>
 foreign import ccall unsafe "Z3_solver_set_params"
