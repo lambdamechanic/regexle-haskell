@@ -801,33 +801,36 @@ applyClueZ3PyClone alphabetDomain stateDomain grid clue = do
       diseqEstimate
   transitionFn <- buildTransitionFunction Z3TransitionLambda stateDomain alphabetDomain info
   states <- mkStateVarsZ3 solverSink stateDomain (length chars) (clueAxis clue) (clueIndex clue)
-  let stateLits =
+  let deadStateLits =
         [ stateLiteral stateDomain idx
         | idx <- IntSet.toList deadStates
         , idx >= 0
         , idx < V.length (sdValues stateDomain)
         ]
-      alphaLits set =
+      aboveStateLits =
+        [ stateLiteral stateDomain idx
+        | idx <- [stateCount .. V.length (sdValues stateDomain) - 1]
+        ]
+      deadAlphabetLits =
         [ alphabetLiteral alphabetDomain idx
-        | idx <- IntSet.toList set
+        | idx <- IntSet.toList deadAlphabet
         , idx >= 0
         , idx < V.length (adValues alphabetDomain)
         ]
-      deadAlphabetLits = alphaLits deadAlphabet
-      initialDeadLits = alphaLits initialDead
+      initialDeadLits =
+        [ alphabetLiteral alphabetDomain idx
+        | idx <- IntSet.toList initialDead
+        , idx >= 0
+        , idx < V.length (adValues alphabetDomain)
+        ]
   forM_ states $ \st ->
-    forM_ stateLits $ \bad -> do
-      neq <- mkNeq st bad
-      Z3.assert neq
+    forM_ (deadStateLits ++ aboveStateLits) $ \bad ->
+      mkDistinctNeq st bad >>= Z3.assert
   forM_ chars $ \cell ->
-    forM_ deadAlphabetLits $ \bad -> do
-      neq <- mkNeq cell bad
-      Z3.assert neq
+    forM_ deadAlphabetLits $ \bad -> mkDistinctNeq cell bad >>= Z3.assert
   case chars of
     (firstCell : _) ->
-      forM_ initialDeadLits $ \bad -> do
-        neq <- mkNeq firstCell bad
-        Z3.assert neq
+      forM_ initialDeadLits $ \bad -> mkDistinctNeq firstCell bad >>= Z3.assert
     _ -> pure ()
   case states of
     (st0 : _) -> do
@@ -840,7 +843,7 @@ applyClueZ3PyClone alphabetDomain stateDomain grid clue = do
     Just finalState -> assertAcceptStateZ3 solverSink stateDomain info finalState
     Nothing -> pure ()
   where
-    mkNeq a b = Z3.mkEq a b >>= Z3.mkNot
+    mkDistinctNeq a b = Z3.mkDistinct [a, b]
 
 applyClueZ3 :: ConstraintSink -> Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
 applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
