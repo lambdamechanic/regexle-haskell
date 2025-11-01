@@ -610,11 +610,14 @@ solvePuzzleZ3PyClone _cfg puzzle clues = do
   resultOrErr <- (try $ Z3.evalZ3 $ do
     alphabetDomain <- mkAlphabetDomain alphabetCardinality
     stateDomain <- mkStateDomain "PyClone" globalStateCount
+    goal <- Z3.mkGoal True False False
     liftIO (writeIORef stageRef "mkGrid")
     grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
     forM_ clues $ \clue -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3PyClone alphabetDomain stateDomain grid clue
+      applyClueZ3PyClone goal alphabetDomain stateDomain grid clue
+    formulas <- Z3.getGoalFormulas goal
+    mapM_ Z3.solverAssertCnstr formulas
     liftIO (writeIORef stageRef "solverCheck")
     mDump <- liftIO (lookupEnv "REGEXLE_PYCLONE_DUMP_DIR")
     forM_ mDump $ \dir -> do
@@ -765,8 +768,8 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3PyClone :: AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3PyClone alphabetDomain stateDomain grid clue = do
+applyClueZ3PyClone :: Z3Base.Goal -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3PyClone goal alphabetDomain stateDomain grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       info = clueDfa clue
       deadStates = diDeadStates info
@@ -823,24 +826,26 @@ applyClueZ3PyClone alphabetDomain stateDomain grid clue = do
         , idx >= 0
         , idx < V.length (adValues alphabetDomain)
         ]
+  let goalSink = ConstraintSink { csEmit = Z3.goalAssert goal, csDeclare = const (pure ()) }
+      emit ast = Z3.goalAssert goal ast
   forM_ states $ \st ->
     forM_ (deadStateLits ++ aboveStateLits) $ \bad ->
-      mkDistinctNeq st bad >>= Z3.assert
+      mkDistinctNeq st bad >>= emit
   forM_ chars $ \cell ->
-    forM_ deadAlphabetLits $ \bad -> mkDistinctNeq cell bad >>= Z3.assert
+    forM_ deadAlphabetLits $ \bad -> mkDistinctNeq cell bad >>= emit
   case chars of
     (firstCell : _) ->
-      forM_ initialDeadLits $ \bad -> mkDistinctNeq firstCell bad >>= Z3.assert
+      forM_ initialDeadLits $ \bad -> mkDistinctNeq firstCell bad >>= emit
     _ -> pure ()
   case states of
     (st0 : _) -> do
       let initLit = stateLiteral stateDomain (diInitial info)
       eq <- Z3.mkEq st0 initLit
-      Z3.assert eq
+      emit eq
     _ -> pure ()
-  applyTransitionsZ3 solverSink transitionFn states chars
+  applyTransitionsZ3 goalSink transitionFn states chars
   case lastMaybe states of
-    Just finalState -> assertAcceptStateZ3 solverSink stateDomain info finalState
+    Just finalState -> assertAcceptStateZ3 goalSink stateDomain info finalState
     Nothing -> pure ()
   where
     mkDistinctNeq a b = Z3.mkDistinct [a, b]
