@@ -8,6 +8,7 @@ module Regexle.Solver
   , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
+  , buildCluesCached
   , solvePuzzle
   , solvePuzzleWith
   , solvePuzzleWithClues
@@ -67,6 +68,7 @@ import Regexle.DFA
 import Regexle.PuzzleCache
   ( Puzzle (..)
   )
+import Regexle.DfaCache (getCachedDfa)
 import Regexle.RegexParser (parseRegexToERE)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>), takeFileName)
@@ -79,10 +81,12 @@ import System.IO
   , hPutStrLn
   , hSetBuffering
   , openFile
+  , stderr
   )
 import Text.Printf (printf)
 import qualified Z3.Base as Z3Base
 import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
 
 -------------------------------------------------------------------------------
 -- Types and configuration
@@ -97,6 +101,7 @@ data Z3TransitionEncoding = Z3TransitionLegacy | Z3TransitionLambda
 data SolveBackend
   = BackendSBV
   | BackendZ3Direct
+  | BackendZ3PyClone
   deriving (Eq, Show)
 
 data SolveConfig = SolveConfig
@@ -125,6 +130,12 @@ enableZ3ConsistencyChecks = do
   when enabled $ do
     -- Turn on Z3 reference-count consistency checks so we get a trapped failure instead of a segfault.
     Z3Base.globalParamSet "debug_ref_count" "true"
+
+pycloneDebug :: Bool
+pycloneDebug = unsafePerformIO $ do
+  flag <- lookupEnv "REGEXLE_PYCLONE_DEBUG"
+  pure (maybe False (not . null) flag)
+{-# NOINLINE pycloneDebug #-}
 
 -------------------------------------------------------------------------------
 -- Solver-facing types
@@ -158,15 +169,23 @@ solvePuzzle = solvePuzzleWith defaultSolveConfig
 
 solvePuzzleWith :: SolveConfig -> Puzzle -> IO (Either String SolveResult)
 solvePuzzleWith cfg puzzle =
-  case buildClues puzzle of
-    Left err -> pure (Left err)
-    Right clues -> solvePuzzleWithClues cfg puzzle clues
+  case scBackend cfg of
+    BackendZ3PyClone -> do
+      eClues <- buildCluesCached puzzle
+      case eClues of
+        Left err -> pure (Left err)
+        Right clues -> solvePuzzleWithClues cfg puzzle clues
+    _ ->
+      case buildClues puzzle of
+        Left err -> pure (Left err)
+        Right clues -> solvePuzzleWithClues cfg puzzle clues
 
 solvePuzzleWithClues :: SolveConfig -> Puzzle -> [Clue] -> IO (Either String SolveResult)
 solvePuzzleWithClues cfg puzzle clues =
   case scBackend cfg of
     BackendSBV -> solvePuzzleSBV (scTransitionEncoding cfg) puzzle clues
     BackendZ3Direct -> solvePuzzleZ3Direct (scZ3TransitionEncoding cfg) puzzle clues
+    BackendZ3PyClone -> solvePuzzleZ3PyClone cfg puzzle clues
 
 solvePuzzlesHot :: SolveConfig -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesHot cfg puzzlesWithClues =
@@ -174,6 +193,8 @@ solvePuzzlesHot cfg puzzlesWithClues =
     BackendSBV -> mapM (uncurry (solvePuzzleSBV (scTransitionEncoding cfg))) puzzlesWithClues
     BackendZ3Direct ->
       solvePuzzlesZ3DirectHot Nothing (scZ3TransitionEncoding cfg) puzzlesWithClues
+    BackendZ3PyClone ->
+      mapM (\(puzzle, clues) -> solvePuzzleZ3PyClone cfg puzzle clues) puzzlesWithClues
 
 -------------------------------------------------------------------------------
 -- SBV backend (existing implementation)
@@ -579,6 +600,56 @@ solvePuzzleZ3Direct encoding puzzle clues = do
           rendered = renderGrid puzzle modelVals
       pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime, srStats = Just (T.pack statsStr)})
 
+solvePuzzleZ3PyClone :: SolveConfig -> Puzzle -> [Clue] -> IO (Either String SolveResult)
+solvePuzzleZ3PyClone _cfg puzzle clues = do
+  buildStart <- getCurrentTime
+  stageRef <- newIORef "initializing"
+  enableZ3ConsistencyChecks
+  let stateCounts = map (max 1 . V.length . diTransitions . clueDfa) clues
+      globalStateCount = maximum (1 : stateCounts)
+  resultOrErr <- (try $ Z3.evalZ3 $ do
+    alphabetDomain <- mkAlphabetDomain alphabetCardinality
+    stateDomain <- mkStateDomain "PyClone" globalStateCount
+    liftIO (writeIORef stageRef "mkGrid")
+    grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
+    forM_ clues $ \clue -> do
+      liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
+      applyClueZ3PyClone alphabetDomain stateDomain grid clue
+    liftIO (writeIORef stageRef "solverCheck")
+    mDump <- liftIO (lookupEnv "REGEXLE_PYCLONE_DUMP_DIR")
+    forM_ mDump $ \dir -> do
+      solverText <- Z3.solverToString
+      let fileName = printf "pyclone-%03d.smt2" (puzzleDay puzzle)
+          outPath = dir </> fileName
+      liftIO $ createDirectoryIfMissing True dir
+      liftIO $ writeFile outPath solverText
+    solveStart <- liftIO getCurrentTime
+    (res, mModel) <- Z3.solverCheckAndGetModel
+    solveEnd <- liftIO getCurrentTime
+    statsText <- Z3.solverGetStatistics
+    case (res, mModel) of
+      (Z3.Sat, Just model) -> do
+        liftIO (writeIORef stageRef "extractModel")
+        values <- extractGridValues Nothing alphabetDomain puzzle grid model
+        pure (Just values, solveStart, solveEnd, statsText)
+      _ -> pure (Nothing, solveStart, solveEnd, statsText)
+    ) :: IO (Either SomeException (Maybe [[Word8]], UTCTime, UTCTime, String))
+  case resultOrErr of
+    Left ex -> do
+      stage <- readIORef stageRef
+      pure (Left ("Z3 solver failed during " ++ stage ++ ": " ++ displayException ex))
+    Right (Nothing, _, _, statsStr) ->
+      pure (Left ("Z3 solver reported UNSAT/UNKNOWN (stats: " ++ statsStr ++ ")"))
+    Right (Just modelVals, solveStart, solveEnd, statsStr) -> do
+      let buildTime = toSeconds (diffUTCTime solveStart buildStart)
+          solveTime = toSeconds (diffUTCTime solveEnd solveStart)
+          rendered = renderGrid puzzle modelVals
+      pure (Right SolveResult { srGrid = rendered
+                              , srBuildTime = buildTime
+                              , srSolveTime = solveTime
+                              , srStats = Just (T.pack statsStr)
+                              })
+
 -------------------------------------------------------------------------------
 -- Hot direct Z3 backend
 -------------------------------------------------------------------------------
@@ -693,6 +764,83 @@ mkGridZ3 alphabetDomain dim =
   forM [0 .. dim - 1] $ \x ->
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
+
+applyClueZ3PyClone :: AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3PyClone alphabetDomain stateDomain grid clue = do
+  let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
+      info = clueDfa clue
+      deadStates = diDeadStates info
+      deadAlphabet = diDeadAlphabet info
+      initialDead =
+        let vec = diDeadFrom info
+         in if V.null vec then IntSet.empty else vec V.! diInitial info
+      clueLen = length chars
+      stateCount = V.length (diTransitions info)
+      deadAlphabetCount = IntSet.size deadAlphabet
+      deadInitCount = IntSet.size initialDead
+      deadStateCount = IntSet.size deadStates
+      domainSize = V.length (adValues alphabetDomain)
+      bannedCount =
+        [ if idx == 0
+            then IntSet.size (deadAlphabet `IntSet.union` initialDead)
+            else deadAlphabetCount
+        | idx <- [0 .. clueLen - 1]
+        ]
+      diseqEstimate = sum bannedCount
+  when pycloneDebug $ liftIO $ do
+    hPutStrLn stderr $ printf
+      "pyclone clue %c%d len=%d states=%d deadAlpha=%d deadInit=%d deadStates=%d domain=%d estBannedNeq=%d"
+      (clueAxis clue)
+      (clueIndex clue)
+      clueLen
+      stateCount
+      deadAlphabetCount
+      deadInitCount
+      deadStateCount
+      domainSize
+      diseqEstimate
+  transitionFn <- buildTransitionFunction Z3TransitionLambda stateDomain alphabetDomain info
+  states <- mkStateVarsZ3 solverSink stateDomain (length chars) (clueAxis clue) (clueIndex clue)
+  let stateLits =
+        [ stateLiteral stateDomain idx
+        | idx <- IntSet.toList deadStates
+        , idx >= 0
+        , idx < V.length (sdValues stateDomain)
+        ]
+      alphaLits set =
+        [ alphabetLiteral alphabetDomain idx
+        | idx <- IntSet.toList set
+        , idx >= 0
+        , idx < V.length (adValues alphabetDomain)
+        ]
+      deadAlphabetLits = alphaLits deadAlphabet
+      initialDeadLits = alphaLits initialDead
+  forM_ states $ \st ->
+    forM_ stateLits $ \bad -> do
+      neq <- mkNeq st bad
+      Z3.assert neq
+  forM_ chars $ \cell ->
+    forM_ deadAlphabetLits $ \bad -> do
+      neq <- mkNeq cell bad
+      Z3.assert neq
+  case chars of
+    (firstCell : _) ->
+      forM_ initialDeadLits $ \bad -> do
+        neq <- mkNeq firstCell bad
+        Z3.assert neq
+    _ -> pure ()
+  case states of
+    (st0 : _) -> do
+      let initLit = stateLiteral stateDomain (diInitial info)
+      eq <- Z3.mkEq st0 initLit
+      Z3.assert eq
+    _ -> pure ()
+  applyTransitionsZ3 solverSink transitionFn states chars
+  case lastMaybe states of
+    Just finalState -> assertAcceptStateZ3 solverSink stateDomain info finalState
+    Nothing -> pure ()
+  where
+    mkNeq a b = Z3.mkEq a b >>= Z3.mkNot
 
 applyClueZ3 :: ConstraintSink -> Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
 applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
@@ -818,21 +966,20 @@ buildTransitionFunction encoding stateDomain alphabetDomain info =
         , tfExpr = expr
         }
     buildLambda = do
-      stateConst <- Z3.mkFreshConst "lambda_state" (sdSort stateDomain)
-      charConst <- Z3.mkFreshConst "lambda_char" (adSort alphabetDomain)
-      body <- transitionLookupZ3 stateDomain alphabetDomain info stateConst charConst
-      charApp <- Z3.toApp charConst
-      inner <- Z3.mkLambdaConst [charApp] body
-      stateApp <- Z3.toApp stateConst
-      outer <- Z3.mkLambdaConst [stateApp] inner
+      let stateSort = sdSort stateDomain
+          charSort = adSort alphabetDomain
+      stateBound <- Z3.mkBound 1 stateSort
+      charBound <- Z3.mkBound 0 charSort
+      body <- transitionLookupZ3 stateDomain alphabetDomain info stateBound charBound
+      stateSym <- Z3.mkStringSymbol "lambda_state"
+      charSym <- Z3.mkStringSymbol "lambda_char"
+      outer <- Z3.mkLambda [(stateSym, stateSort), (charSym, charSort)] body
       pure (TransitionLambda outer)
 
 applyTransitionFunction :: TransitionFunction -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
 applyTransitionFunction transFn st ch =
   case transFn of
-    TransitionLambda arr -> do
-      row <- Z3.mkSelect arr st
-      Z3.mkSelect row ch
+    TransitionLambda func -> Z3.mkSelectN func [st, ch]
     TransitionSubstitute { tfParamState = stateParam
                          , tfParamChar = charParam
                          , tfExpr = expr
@@ -914,6 +1061,43 @@ buildClues puzzle = do
         , clueDfa = dfa
         , clueCoords = coords
         }
+
+    formatError axis idx pat err =
+      "Pattern parse error for "
+        ++ [axis]
+        ++ show idx
+        ++ ": "
+        ++ err
+        ++ " (pattern: "
+        ++ T.unpack pat
+        ++ ")"
+
+buildCluesCached :: Puzzle -> IO (Either String [Clue])
+buildCluesCached puzzle = do
+  let side = puzzleSide puzzle
+      dim = puzzleDiameter puzzle
+      collect axisFn axisChar patterns =
+        map (\(idx, pat) -> (axisChar, idx, pat, axisFn idx)) (zip [0 ..] patterns)
+      requests =
+        collect (axisX dim side) 'x' (puzzleX puzzle)
+          ++ collect (axisY dim side) 'y' (puzzleY puzzle)
+          ++ collect (axisZ dim side) 'z' (puzzleZ puzzle)
+  results <- forM requests buildCached
+  pure (sequence results)
+  where
+    buildCached (axis, idx, pat, coords) = do
+      eDfa <- getCachedDfa pat
+      pure $ case eDfa of
+        Left err -> Left (formatError axis idx pat err)
+        Right dfa ->
+          Right
+            Clue
+              { clueAxis = axis
+              , clueIndex = idx
+              , cluePattern = pat
+              , clueDfa = dfa
+              , clueCoords = coords
+              }
 
     formatError axis idx pat err =
       "Pattern parse error for "
