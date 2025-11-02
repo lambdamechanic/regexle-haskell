@@ -28,7 +28,8 @@ import Control.Monad (foldM, forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (toLower)
 import qualified Data.IntSet as IntSet
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.IntMap.Strict as IntMap
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -612,10 +613,12 @@ solvePuzzleZ3PyClone _cfg puzzle clues = do
     stateDomain <- mkStateDomain "PyClone" globalStateCount
     goal <- Z3.mkGoal True False False
     liftIO (writeIORef stageRef "mkGrid")
-    grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
+    let dim = puzzleDiameter puzzle
+    grid <- mkGridZ3 alphabetDomain dim
+    alphabetBanRef <- liftIO (newIORef IntMap.empty)
     forM_ clues $ \clue -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3PyClone goal alphabetDomain stateDomain grid clue
+      applyClueZ3PyClone goal dim alphabetBanRef alphabetDomain stateDomain grid clue
     formulas <- Z3.getGoalFormulas goal
     mapM_ Z3.solverAssertCnstr formulas
     liftIO (writeIORef stageRef "solverCheck")
@@ -768,9 +771,10 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3PyClone :: Z3Base.Goal -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3PyClone goal alphabetDomain stateDomain grid clue = do
+applyClueZ3PyClone :: Z3Base.Goal -> Int -> IORef (IntMap.IntMap IntSet.IntSet) -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3PyClone goal dim alphabetBansRef alphabetDomain stateDomain grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
+      indexedChars = zip (clueCoords clue) chars
       info = clueDfa clue
       deadStates = diDeadStates info
       deadAlphabet = diDeadAlphabet info
@@ -783,6 +787,18 @@ applyClueZ3PyClone goal alphabetDomain stateDomain grid clue = do
       deadInitCount = IntSet.size initialDead
       deadStateCount = IntSet.size deadStates
       domainSize = V.length (adValues alphabetDomain)
+      deadAlphabetIdxs =
+        [ idx
+        | idx <- IntSet.toList deadAlphabet
+        , idx >= 0
+        , idx < domainSize
+        ]
+      initialDeadIdxs =
+        [ idx
+        | idx <- IntSet.toList initialDead
+        , idx >= 0
+        , idx < domainSize
+        ]
       bannedCount =
         [ if idx == 0
             then IntSet.size (deadAlphabet `IntSet.union` initialDead)
@@ -814,29 +830,27 @@ applyClueZ3PyClone goal alphabetDomain stateDomain grid clue = do
         [ stateLiteral stateDomain idx
         | idx <- [stateCount .. V.length (sdValues stateDomain) - 1]
         ]
-      deadAlphabetLits =
-        [ alphabetLiteral alphabetDomain idx
-        | idx <- IntSet.toList deadAlphabet
-        , idx >= 0
-        , idx < V.length (adValues alphabetDomain)
-        ]
-      initialDeadLits =
-        [ alphabetLiteral alphabetDomain idx
-        | idx <- IntSet.toList initialDead
-        , idx >= 0
-        , idx < V.length (adValues alphabetDomain)
-        ]
   let goalSink = ConstraintSink { csEmit = Z3.goalAssert goal, csDeclare = const (pure ()) }
       emit ast = Z3.goalAssert goal ast
   forM_ states $ \st ->
     forM_ (deadStateLits ++ aboveStateLits) $ \bad ->
       mkDistinctNeq st bad >>= emit
-  forM_ chars $ \cell ->
-    forM_ deadAlphabetLits $ \bad -> mkDistinctNeq cell bad >>= emit
-  case chars of
-    (firstCell : _) ->
-      forM_ initialDeadLits $ \bad -> mkDistinctNeq firstCell bad >>= emit
-    _ -> pure ()
+  let firstCoord = case clueCoords clue of
+        [] -> Nothing
+        (c:_) -> Just c
+  forM_ indexedChars $ \(coord, cell) -> do
+    let key = cellIndex coord
+    newGeneral <- liftIO $ recordBans key deadAlphabetIdxs
+    forM_ newGeneral $ \idx -> do
+      let lit = alphabetLiteral alphabetDomain idx
+      mkDistinctNeq cell lit >>= emit
+    case firstCoord of
+      Just fc | coord == fc -> do
+        newInitial <- liftIO $ recordBans key initialDeadIdxs
+        forM_ newInitial $ \idx -> do
+          let lit = alphabetLiteral alphabetDomain idx
+          mkDistinctNeq cell lit >>= emit
+      _ -> pure ()
   case states of
     (st0 : _) -> do
       let initLit = stateLiteral stateDomain (diInitial info)
@@ -849,6 +863,14 @@ applyClueZ3PyClone goal alphabetDomain stateDomain grid clue = do
     Nothing -> pure ()
   where
     mkDistinctNeq a b = Z3.mkDistinct [a, b]
+    cellIndex (x, y) = x * dim + y
+    recordBans key idxs =
+      atomicModifyIORef' alphabetBansRef $ \m ->
+        let current = IntMap.findWithDefault IntSet.empty key m
+            newIndices = filter (`IntSet.notMember` current) idxs
+            updated = IntSet.union current (IntSet.fromList newIndices)
+            newMap = IntMap.insert key updated m
+         in (newMap, newIndices)
 
 applyClueZ3 :: ConstraintSink -> Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
 applyClueZ3 sink encoding alphabetDomain stateDomain stateLimit grid clue = do
