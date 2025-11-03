@@ -4,6 +4,7 @@ module Regexle.Solver
   ( SolveBackend (..)
   , SolveConfig (..)
   , SolveResult (..)
+  , Clue (..)
   , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
@@ -20,6 +21,10 @@ module Regexle.Solver
   , hotDumpBaseFile
   , hotDumpPuzzleFile
   , enableZ3ConsistencyChecks
+  , mkAlphabetDomain
+  , mkStateDomain
+  , mkGridZ3
+  , applyClueZ3PyClone
   ) where
 
 import Control.Exception (SomeException, displayException, finally, try)
