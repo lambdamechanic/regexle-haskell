@@ -15,7 +15,7 @@ jobs:
           submodules: true
 
       - name: Set up Haskell
-        uses: haskell-actions/setup@v4
+        uses: haskell-actions/setup@v2.8.2
         with:
           ghc-version: "9.12.2"
           cabal-version: "3.16.0.0"
