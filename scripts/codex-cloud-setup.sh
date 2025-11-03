@@ -63,3 +63,5 @@ python3 -m pip --version >/dev/null 2>&1 || true
 export GOBIN="$HOME/.local/bin"
 
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+
+git config --global --add safe.directory '*' || true

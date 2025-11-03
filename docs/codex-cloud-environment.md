@@ -34,4 +34,4 @@ bash scripts/test-codex-cloud-env.sh
 | `scripts/codex-cloud-setup.sh` | Primary bootstrap copied into Codex. |
 | `scripts/codex-cloud-maintenance.sh` | Lightweight upkeep (`cabal update`). |
 | `Dockerfile.codex-cloud` | Cacheable Codex-ready base image layer. |
-| `scripts/test-codex-cloud-env.sh` | Builds the Dockerfile, verifies `bd`/`cabal`, and runs `cabal test --enable-tests`. |
+| `scripts/test-codex-cloud-env.sh` | Builds the Dockerfile, then runs `cabal test --enable-tests` inside the image. |
