@@ -24,11 +24,12 @@ module Regexle.Solver
   ) where
 
 import Control.Exception (SomeException, displayException, finally, try)
-import Control.Monad (foldM, forM, forM_, when)
+import Control.Monad (forM, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (toLower)
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap.Strict as IntMap
+import qualified Data.Map.Strict as Map
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -533,35 +534,47 @@ appendDriver spec path =
 mkAlphabetDomain :: Int -> Z3.Z3 AlphabetDomain
 mkAlphabetDomain n = do
   let size = max 1 n
-  (sort, values) <- mkEnumeratedDomain "AlphabetSort" "AlphabetValue" size
+  sort <- Z3.mkIntSort
+  values <- V.generateM size $ \idx -> Z3.mkIntNum (toInteger idx)
   pure AlphabetDomain { adSort = sort, adValues = values }
 
 mkStateDomain :: String -> Int -> Z3.Z3 StateDomain
-mkStateDomain label n = do
+mkStateDomain _label n = do
   let size = max 1 n
-      sortName = "StateSort_" ++ label
-      ctorPrefix = "StateValue_" ++ label
-  (sort, values) <- mkEnumeratedDomain sortName ctorPrefix size
+  sort <- Z3.mkIntSort
+  values <- V.generateM size $ \idx -> Z3.mkIntNum (toInteger idx)
   pure StateDomain { sdSort = sort, sdValues = values }
-
-mkEnumeratedDomain :: String -> String -> Int -> Z3.Z3 (Z3.Sort, V.Vector Z3.AST)
-mkEnumeratedDomain sortLabel ctorPrefix size = do
-  sortSym <- Z3.mkStringSymbol sortLabel
-  constructors <- forM [0 .. size - 1] $ \idx -> do
-    ctorSym <- Z3.mkStringSymbol (ctorPrefix ++ "_" ++ show idx)
-    testerSym <- Z3.mkStringSymbol (ctorPrefix ++ "_is_" ++ show idx)
-    Z3.mkConstructor ctorSym testerSym []
-  sort <- Z3.mkDatatype sortSym constructors
-  ctorDecls <- Z3.getDatatypeSortConstructors sort
-  let ctorVec = V.fromList ctorDecls
-  values <- V.generateM size $ \idx -> Z3.mkApp (ctorVec V.! idx) []
-  pure (sort, values)
 
 alphabetLiteral :: AlphabetDomain -> Int -> Z3.AST
 alphabetLiteral dom idx = adValues dom V.! idx
 
 stateLiteral :: StateDomain -> Int -> Z3.AST
 stateLiteral dom idx = sdValues dom V.! idx
+
+alphabetDomainSize :: AlphabetDomain -> Int
+alphabetDomainSize = V.length . adValues
+
+stateDomainSize :: StateDomain -> Int
+stateDomainSize = V.length . sdValues
+
+assertAlphabetBounds :: (Z3.AST -> Z3.Z3 ()) -> AlphabetDomain -> Z3.AST -> Z3.Z3 ()
+assertAlphabetBounds emit domain cell = do
+  zero <- Z3.mkIntNum (0 :: Integer)
+  geZero <- Z3.mkGe cell zero
+  emit geZero
+  limit <- Z3.mkIntNum (toInteger (alphabetDomainSize domain))
+  ltLimit <- Z3.mkLt cell limit
+  emit ltLimit
+
+assertStateBounds :: (Z3.AST -> Z3.Z3 ()) -> Int -> Z3.AST -> Z3.Z3 ()
+assertStateBounds emit stateLimit st = do
+  zero <- Z3.mkIntNum (0 :: Integer)
+  geZero <- Z3.mkGe st zero
+  emit geZero
+  when (stateLimit > 0) $ do
+    limit <- Z3.mkIntNum (toInteger stateLimit)
+    ltLimit <- Z3.mkLt st limit
+    emit ltLimit
 
 solvePuzzleZ3Direct :: Z3TransitionEncoding -> Puzzle -> [Clue] -> IO (Either String SolveResult)
 solvePuzzleZ3Direct encoding puzzle clues = do
@@ -575,6 +588,9 @@ solvePuzzleZ3Direct encoding puzzle clues = do
     stateDomain <- mkStateDomain "GlobalState" globalStateCount
     liftIO (writeIORef stageRef "mkGrid")
     grid <- mkGridZ3 alphabetDomain (puzzleDiameter puzzle)
+    forM_ grid $ \row ->
+      forM_ row $ \cell ->
+        assertAlphabetBounds (csEmit solverSink) alphabetDomain cell
     forM_ (zip clues stateCounts) $ \(clue, stateLimit) -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
       applyClueZ3 solverSink encoding alphabetDomain stateDomain stateLimit grid clue
@@ -601,6 +617,11 @@ solvePuzzleZ3Direct encoding puzzle clues = do
           rendered = renderGrid puzzle modelVals
       pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime, srStats = Just (T.pack statsStr)})
 
+data StateBanKey = StateBanKey !Char !Int !Int
+  deriving (Eq, Ord)
+
+type StateBanCache = Map.Map StateBanKey IntSet.IntSet
+
 solvePuzzleZ3PyClone :: SolveConfig -> Puzzle -> [Clue] -> IO (Either String SolveResult)
 solvePuzzleZ3PyClone _cfg puzzle clues = do
   buildStart <- getCurrentTime
@@ -616,9 +637,14 @@ solvePuzzleZ3PyClone _cfg puzzle clues = do
     let dim = puzzleDiameter puzzle
     grid <- mkGridZ3 alphabetDomain dim
     alphabetBanRef <- liftIO (newIORef IntMap.empty)
+    stateBanRef <- liftIO (newIORef Map.empty)
+    let emitBounds = Z3.goalAssert goal
+    forM_ grid $ \row ->
+      forM_ row $ \cell ->
+        assertAlphabetBounds emitBounds alphabetDomain cell
     forM_ clues $ \clue -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3PyClone goal dim alphabetBanRef alphabetDomain stateDomain grid clue
+      applyClueZ3PyClone goal dim alphabetBanRef stateBanRef alphabetDomain stateDomain grid clue
     formulas <- Z3.getGoalFormulas goal
     mapM_ Z3.solverAssertCnstr formulas
     liftIO (writeIORef stageRef "solverCheck")
@@ -678,6 +704,9 @@ solvePuzzlesZ3DirectHotWithDump dumpDir chunkLimit dryRun encoding jobs = do
             alphabetDomain <- mkAlphabetDomain alphabetCardinality
             stateDomain <- mkStateDomain "GlobalStateHot" (chunkStateCount chunk)
             grid <- mkGridZ3 alphabetDomain (puzzleDiameter firstPuzzle)
+            forM_ grid $ \row ->
+              forM_ row $ \cell ->
+                assertAlphabetBounds (csEmit solverSink) alphabetDomain cell
             maybeDumpBase spec alphabetDomain stateDomain grid
             forM chunk $ \(puzzle, clues) -> do
               liftIO (writeIORef stageRef ("puzzle " ++ show (puzzleDay puzzle)))
@@ -771,8 +800,8 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3PyClone :: Z3Base.Goal -> Int -> IORef (IntMap.IntMap IntSet.IntSet) -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3PyClone goal dim alphabetBansRef alphabetDomain stateDomain grid clue = do
+applyClueZ3PyClone :: Z3Base.Goal -> Int -> IORef (IntMap.IntMap IntSet.IntSet) -> IORef StateBanCache -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3PyClone goal dim alphabetBansRef stateBansRef alphabetDomain stateDomain grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       indexedChars = zip (clueCoords clue) chars
       info = clueDfa clue
@@ -786,29 +815,39 @@ applyClueZ3PyClone goal dim alphabetBansRef alphabetDomain stateDomain grid clue
       deadAlphabetCount = IntSet.size deadAlphabet
       deadInitCount = IntSet.size initialDead
       deadStateCount = IntSet.size deadStates
-      domainSize = V.length (adValues alphabetDomain)
+      alphabetCap = alphabetDomainSize alphabetDomain
+      stateDomainCap = stateDomainSize stateDomain
+      stateVarCount = clueLen + 1
       deadAlphabetIdxs =
         [ idx
         | idx <- IntSet.toList deadAlphabet
         , idx >= 0
-        , idx < domainSize
+        , idx < alphabetCap
         ]
       initialDeadIdxs =
         [ idx
         | idx <- IntSet.toList initialDead
         , idx >= 0
-        , idx < domainSize
+        , idx < alphabetCap
         ]
-      bannedCount =
+      alphabetBanCounts =
         [ if idx == 0
             then IntSet.size (deadAlphabet `IntSet.union` initialDead)
             else deadAlphabetCount
         | idx <- [0 .. clueLen - 1]
         ]
-      diseqEstimate = sum bannedCount
+      stateBanContribution = stateVarCount * length deadStateIdxs
+      diseqEstimate = sum alphabetBanCounts + stateBanContribution
+      deadStateIdxs =
+        [ idx
+        | idx <- IntSet.toList deadStates
+        , idx >= 0
+        , idx < stateCount
+        ]
+      bannedStateIdxs = IntSet.toList (IntSet.fromList deadStateIdxs)
   when pycloneDebug $ liftIO $ do
     hPutStrLn stderr $ printf
-      "pyclone clue %c%d len=%d states=%d deadAlpha=%d deadInit=%d deadStates=%d domain=%d estBannedNeq=%d"
+      "pyclone clue %c%d len=%d states=%d deadAlpha=%d deadInit=%d deadStates=%d alphaDomain=%d stateDomain=%d estBannedNeq=%d"
       (clueAxis clue)
       (clueIndex clue)
       clueLen
@@ -816,25 +855,20 @@ applyClueZ3PyClone goal dim alphabetBansRef alphabetDomain stateDomain grid clue
       deadAlphabetCount
       deadInitCount
       deadStateCount
-      domainSize
+      alphabetCap
+      stateDomainCap
       diseqEstimate
   transitionFn <- buildTransitionFunction Z3TransitionLambda stateDomain alphabetDomain info
   states <- mkStateVarsZ3 solverSink stateDomain (length chars) (clueAxis clue) (clueIndex clue)
-  let deadStateLits =
-        [ stateLiteral stateDomain idx
-        | idx <- IntSet.toList deadStates
-        , idx >= 0
-        , idx < V.length (sdValues stateDomain)
-        ]
-      aboveStateLits =
-        [ stateLiteral stateDomain idx
-        | idx <- [stateCount .. V.length (sdValues stateDomain) - 1]
-        ]
   let goalSink = ConstraintSink { csEmit = Z3.goalAssert goal, csDeclare = const (pure ()) }
       emit ast = Z3.goalAssert goal ast
-  forM_ states $ \st ->
-    forM_ (deadStateLits ++ aboveStateLits) $ \bad ->
-      mkDistinctNeq st bad >>= emit
+      stateKey offset = StateBanKey (clueAxis clue) (clueIndex clue) offset
+  forM_ (zip [0 ..] states) $ \(stateOffset, st) -> do
+    assertStateBounds emit stateCount st
+    newStateBans <- liftIO $ recordStateBans (stateKey stateOffset) bannedStateIdxs
+    forM_ newStateBans $ \idx -> do
+      let lit = stateLiteral stateDomain idx
+      mkDistinctNeq st lit >>= emit
   let firstCoord = case clueCoords clue of
         [] -> Nothing
         (c:_) -> Just c
@@ -870,6 +904,13 @@ applyClueZ3PyClone goal dim alphabetBansRef alphabetDomain stateDomain grid clue
             newIndices = filter (`IntSet.notMember` current) idxs
             updated = IntSet.union current (IntSet.fromList newIndices)
             newMap = IntMap.insert key updated m
+         in (newMap, newIndices)
+    recordStateBans key idxs =
+      atomicModifyIORef' stateBansRef $ \m ->
+        let current = Map.findWithDefault IntSet.empty key m
+            newIndices = filter (`IntSet.notMember` current) idxs
+            updated = IntSet.union current (IntSet.fromList newIndices)
+            newMap = Map.insert key updated m
          in (newMap, newIndices)
 
 applyClueZ3 :: ConstraintSink -> Z3TransitionEncoding -> AlphabetDomain -> StateDomain -> Int -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
@@ -911,21 +952,22 @@ mkStateVarsZ3 sink stateDomain len axis idx =
 
 restrictStatesZ3 :: ConstraintSink -> StateDomain -> Int -> IntSet.IntSet -> [Z3.AST] -> Z3.Z3 ()
 restrictStatesZ3 sink stateDomain stateLimit deadStates states = do
-  let domainSize = V.length (sdValues stateDomain)
-      bannedDead = [ stateLiteral stateDomain idx
-                   | idx <- IntSet.toList deadStates
-                   , idx >= 0
-                   , idx < domainSize
-                   ]
-      bannedAbove = [ stateLiteral stateDomain idx
-                    | idx <- [stateLimit .. domainSize - 1]
-                    ]
-      bannedLits = bannedDead ++ bannedAbove
-  forM_ states $ \st ->
-    forM_ bannedLits $ \bad -> do
-      eq <- Z3.mkEq st bad
+  let emit = csEmit sink
+      domainSize = stateDomainSize stateDomain
+      limit = max 0 (min stateLimit domainSize)
+      deadIdxs =
+        [ idx
+        | idx <- IntSet.toList deadStates
+        , idx >= 0
+        , idx < limit
+        ]
+  forM_ states $ \st -> do
+    assertStateBounds emit limit st
+    forM_ deadIdxs $ \idx -> do
+      let lit = stateLiteral stateDomain idx
+      eq <- Z3.mkEq st lit
       neq <- Z3.mkNot eq
-      csEmit sink neq
+      emit neq
 
 restrictAlphabetZ3 :: ConstraintSink -> AlphabetDomain -> IntSet.IntSet -> Z3.AST -> Z3.Z3 ()
 restrictAlphabetZ3 sink alphabetDomain banned cell =
@@ -960,25 +1002,66 @@ assertAcceptStateZ3 sink stateDomain info finalState =
 
 transitionLookupZ3 :: StateDomain -> AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
 transitionLookupZ3 stateDomain alphabetDomain info st ch = do
-  let rows = zip [0 :: Int ..] (V.toList (diTransitions info))
-  let defaultLit = stateLiteral stateDomain 0
-  foldM step defaultLit rows
+  let transitions = diTransitions info
+      classes = diColumnClasses info
+  classTests <- V.mapM (buildClassTest ch) classes
+  rowExprs <- V.mapM (buildRowExpr classTests) transitions
+  buildStateExpr (zip [0 :: Int ..] (V.toList rowExprs))
   where
-    step acc (idx, row) = do
-      let idxLit = stateLiteral stateDomain idx
-      cond <- Z3.mkEq st idxLit
-      rowVal <- lookupRow row
-      Z3.mkIte cond rowVal acc
-    lookupRow row = do
-      let cols = zip [0 :: Int ..] (V.toList row)
-          defaultDest = if V.null row then 0 else V.last row
-      let defaultDestLit = stateLiteral stateDomain defaultDest
-      foldM (stepCol ch) defaultDestLit cols
-    stepCol cell acc (cIdx, dst) = do
-      let charLit = alphabetLiteral alphabetDomain cIdx
-          dstLit = stateLiteral stateDomain dst
-      cond <- Z3.mkEq cell charLit
-      Z3.mkIte cond dstLit acc
+    buildClassTest cell members = do
+      let idxs = V.toList members
+      eqs <- forM idxs $ \idx -> do
+        let lit = alphabetLiteral alphabetDomain idx
+        Z3.mkEq cell lit
+      case eqs of
+        [] -> Z3.mkFalse
+        [single] -> pure single
+        _ -> Z3.mkOr eqs
+
+    buildRowExpr classTests row = do
+      let classesVec = diColumnClasses info
+          classCount = V.length classTests
+          fallback = if V.null row then 0 else V.last row
+      dests <- V.generateM classCount $ \classIdx -> do
+        let members = classesVec V.! classIdx
+            repIdx = if V.null members then 0 else members V.! 0
+            dstIdx =
+              if repIdx < V.length row
+                then row V.! repIdx
+                else fallback
+        pure (stateLiteral stateDomain dstIdx)
+      let pairs = zip (V.toList classTests) (V.toList dests)
+      case pairs of
+        [] -> pure (stateLiteral stateDomain fallback)
+        _ -> buildClassExpr pairs
+
+    buildClassExpr pairs = do
+      let (initPairs, lastPair) = case pairs of
+            [] -> ([], Nothing)
+            _  -> (init pairs, Just (last pairs))
+      base <- case lastPair of
+        Nothing -> pure (stateLiteral stateDomain 0)
+        Just (_, dst) -> pure dst
+      foldrM step base initPairs
+      where
+        step (cond, dst) acc = Z3.mkIte cond dst acc
+
+    buildStateExpr [] = pure (stateLiteral stateDomain 0)
+    buildStateExpr pairs = do
+      let (initPairs, lastPair) = (init pairs, last pairs)
+          (_, lastRow) = lastPair
+      foldrM step lastRow initPairs
+      where
+        step (idx, rowExpr) acc = do
+          let idxLit = stateLiteral stateDomain idx
+          cond <- Z3.mkEq st idxLit
+          Z3.mkIte cond rowExpr acc
+
+foldrM :: (Monad m) => (a -> b -> m b) -> b -> [a] -> m b
+foldrM _ acc [] = pure acc
+foldrM f acc (x:xs) = do
+  rest <- foldrM f acc xs
+  f x rest
 
 buildTransitionFunction :: Z3TransitionEncoding -> StateDomain -> AlphabetDomain -> DfaInfo -> Z3.Z3 TransitionFunction
 buildTransitionFunction encoding stateDomain alphabetDomain info =
@@ -1030,17 +1113,13 @@ extractCellValue mEvalLog alphabetDomain model cell = do
   mVal <- Z3.modelEval model cell True
   case mVal of
     Nothing -> liftIO (ioError (userError "Z3 model missing cell value"))
-    Just ast -> matchLiteral 0 (V.toList (adValues alphabetDomain)) ast
-  where
-    matchLiteral :: Int -> [Z3.AST] -> Z3.AST -> Z3.Z3 Word8
-    matchLiteral _ [] badAst = do
-      rendered <- Z3.astToString badAst
-      liftIO (ioError (userError ("Unexpected alphabet literal: " ++ rendered)))
-    matchLiteral idx (lit:lits) candidate = do
-      same <- Z3.isEqAST candidate lit
-      if same
-        then pure (fromIntegral idx :: Word8)
-        else matchLiteral (idx + 1) lits candidate
+    Just ast -> do
+      intVal <- Z3.getInt ast
+      let idx = fromIntegral intVal :: Int
+      when (idx < 0 || idx >= alphabetDomainSize alphabetDomain) $ do
+        rendered <- Z3.astToString ast
+        liftIO (ioError (userError ("Alphabet index out of range: " ++ rendered)))
+      pure (fromIntegral idx :: Word8)
 
 extractGridValues :: Maybe (IORef [String]) -> AlphabetDomain -> Puzzle -> [[Z3.AST]] -> Z3.Model -> Z3.Z3 [[Word8]]
 extractGridValues mEvalLog alphabetDomain puzzle grid model =

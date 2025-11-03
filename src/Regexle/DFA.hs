@@ -10,12 +10,14 @@ module Regexle.DFA
 
 import Data.IntMap.Strict (IntMap)
 import Data.IntSet (IntSet)
+import Data.List (foldl')
 import Data.Vector (Vector)
 import qualified Data.Vector as V
 
 import qualified Data.Function.Step.Discrete.Closed as SF
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
+import qualified Data.Map.Strict as Map
 import qualified Kleene.DFA as KDFA
 import qualified Kleene.ERE as ERE
 
@@ -26,6 +28,8 @@ data DfaInfo = DfaInfo
   , diDeadStates :: !IntSet
   , diDeadAlphabet :: !IntSet
   , diDeadFrom :: !(Vector IntSet)
+  , diColumnClasses :: !(Vector (Vector Int))
+  , diColumnClassOf :: !(Vector Int)
   }
   deriving (Eq, Show)
 
@@ -58,6 +62,9 @@ fromDfa dfa =
           ]
       maxState = if IntSet.null stateIds then 0 else IntSet.findMax stateIds
       rows = V.generate (maxState + 1) (buildRow trans)
+      columnData = buildColumnClasses rows
+      columnClasses = fst columnData
+      columnClassOf = snd columnData
       deadStates = KDFA.dfaBlackholes dfa
       deadAlphabet' = computeDeadAlphabet rows deadStates
       deadFromVec = computeDeadFrom rows deadStates
@@ -68,6 +75,8 @@ fromDfa dfa =
         , diDeadStates = deadStates
         , diDeadAlphabet = deadAlphabet'
         , diDeadFrom = deadFromVec
+        , diColumnClasses = columnClasses
+        , diColumnClassOf = columnClassOf
         }
   where
     buildRow :: IntMap (SF.SF Char Int) -> Int -> Vector Int
@@ -103,3 +112,42 @@ computeDeadFrom rows deadStates =
         IntSet.empty
     )
     rows
+
+buildColumnClasses :: Vector (Vector Int) -> (Vector (Vector Int), Vector Int)
+buildColumnClasses rows
+  | charCount <= 0 = (V.empty, V.empty)
+  | otherwise =
+      let signatures =
+            [ (idx, columnSignature idx)
+            | idx <- [0 .. charCount - 1]
+            ]
+          classMap =
+            foldl'
+              ( \acc (idx, sig) ->
+                  Map.insertWith (++) sig [idx] acc
+              )
+              Map.empty
+              signatures
+          classLists = map reverse (Map.elems classMap)
+          classVec = V.fromList (map V.fromList classLists)
+          assignments =
+            concat
+              [ [ (member, classIdx)
+                | member <- members
+                ]
+              | (classIdx, members) <- zip [0 :: Int ..] classLists
+              ]
+          classOf =
+            if charCount <= 0
+              then V.empty
+              else V.accum
+                     (\_ new -> new)
+                     (V.replicate charCount 0)
+                     assignments
+       in (classVec, classOf)
+  where
+    charCount
+      | V.null rows = 0
+      | otherwise = V.length (V.head rows)
+    columnSignature idx =
+      V.toList (V.map (\row -> row V.! idx) rows)
