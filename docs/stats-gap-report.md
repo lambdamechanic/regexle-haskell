@@ -19,7 +19,7 @@ This note summarizes the most recent benchmark sweep (side 3, days 400–409) as
 - **Solve-stage parity achieved**: The new enum-based hot backend averages **6.3 ms solve / 6.2 ms build** per puzzle, edging out Python `enum_func` lambda on both axes while keeping total time to ~12.5 ms. (See `z3_enum_hot` vs `py_enum_lambda` above.)
 - **Cold enum baseline**: Even without solver reuse, the enum encoding closes most of the remaining gap (11.7 ms solve) while staying under 18 ms build, so we can fall back to `z3_enum` if the hot solver is disabled.
 - **Legacy lambda fallback**: The substitute-style direct backend (`z3_legacy`) is still ~1.5× slower than the tuple/enum encodings, so it remains a debugging-only path.
-- **SBV baseline**: SBV variants continue to spend ≈1.2 s per puzzle on build, reaffirming that the direct Z3 backend is the only viable option for competitive runs.
+- **SBV baseline**: SBV variants continue to spend ≈1.2 s per puzzle on build, reaffirming that the direct Z3 backend is the only viable option for competitive runs. The SBV backends were formally removed on 2025-11-03; these numbers remain for historical comparison.
 - **Version parity**: All measurements above are with Z3 4.15.3 on both Python and Haskell, so we can attribute differences to encoding/implementation rather than solver vintage.
 
 ## Next measurement targets

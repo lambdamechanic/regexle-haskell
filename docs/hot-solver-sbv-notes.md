@@ -1,6 +1,8 @@
 Hot Solver via SBV Query Mode
 =============================
 
+> **Status (November 3, 2025):** The SBV backend has been removed from the main build because it remained an order of magnitude slower than our direct Z3 encoders even after extensive tuning. This document is retained for historical context only.
+
 Motivation
 ----------
 - Profiling (`regexle-haskell.prof`, Oct 25 2025) shows ~28% of CPU time in `Data.SBV.SMT.SMTLib2.cvt` and ~20% in the `Data.Data.gfoldl` traversals SBV uses while constructing constraints. The actual Z3 solve time is only ~0.09s per puzzle.

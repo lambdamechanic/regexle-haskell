@@ -17,7 +17,7 @@ cabal run regexle-haskell -- \
 
 Toggles to remember:
 
-- `--strategy` accepts `lookup`, `lambda`, `enum`, `z3`, and `z3-legacy`. When comparing SBV variants, run one command per encoding.
+- `--strategy` accepts `z3`, `z3-legacy`, and `pyclone`. The SBV encodings (`lookup`, `lambda`, `enum`) were retired on 2025-11-03 after repeated benchmarks showed they spent ≈1.2 s per puzzle in build time; the newer Z3 backends are leaner and avoid the entire SBV dependency stack.
 - `--hot-solver` keeps a single solver alive across the sweep (useful for experiments, not the baseline numbers above).
 - `--strategy-config` flags from the Python tool can be mirrored by extending the CLI or the JSON output if needed.
 

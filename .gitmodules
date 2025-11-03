@@ -1,9 +1,6 @@
 [submodule "third_party/nelhage-sandbox"]
     path = third_party/nelhage-sandbox
     url = git@github.com:lambdamechanic/nelhage-sandbox.git
-[submodule "third_party/sbv-fork"]
-	path = third_party/sbv-fork
-	url = git@github.com:lambdamechanic/sbv.git
 [submodule "z3-415.3"]
 	path = z3-415.3
 	url = git@github.com:lambdamechanic/z3-415.3.git

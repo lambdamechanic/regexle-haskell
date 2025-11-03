@@ -23,7 +23,6 @@ import Regexle.Solver
   ( SolveBackend (..)
   , SolveConfig (..)
   , SolveResult (..)
-  , TransitionEncoding (..)
   , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
@@ -60,8 +59,7 @@ data FetchOptions = FetchOptions
   deriving (Show)
 
 data SolverStrategy
-  = StrategySBV TransitionEncoding
-  | StrategyDirectZ3 !Z3TransitionEncoding
+  = StrategyDirectZ3 !Z3TransitionEncoding
   | StrategyPyClone
   deriving (Eq, Show)
 
@@ -157,9 +155,9 @@ matrixOptionsParser =
       (eitherReader parseStrategyList)
       ( long "strategies"
           <> metavar "LIST"
-          <> help "Comma list of solver strategies (lookup,lambda,enum,z3,z3-legacy,pyclone)"
-          <> value [StrategySBV UseLookup, StrategySBV UseLambda, StrategyDirectZ3 Z3TransitionLambda]
-          <> showDefaultWith (const "lookup,lambda,z3")
+          <> help "Comma list of solver strategies (z3,z3-legacy,pyclone)"
+          <> value [StrategyDirectZ3 Z3TransitionLambda, StrategyDirectZ3 Z3TransitionLegacy, StrategyPyClone]
+          <> showDefaultWith (const "z3,z3-legacy,pyclone")
       )
     <*> strOption
       ( long "output"
@@ -197,9 +195,9 @@ profileOptionsParser =
       (eitherReader parseStrategySingle)
       ( long "strategy"
           <> metavar "NAME"
-          <> help "Solver strategy (lookup, lambda, enum, z3, z3-legacy, or pyclone)"
-          <> showDefaultWith (const "lambda")
-          <> value (StrategySBV UseLambda)
+          <> help "Solver strategy (z3, z3-legacy, or pyclone)"
+          <> showDefaultWith (const "z3")
+          <> value (StrategyDirectZ3 Z3TransitionLambda)
       )
     <*> strOption
       ( long "output"
@@ -325,21 +323,6 @@ strategySpecs = map strategySpecFrom
 strategySpecFrom :: SolverStrategy -> StrategySpec
 strategySpecFrom strat =
   case strat of
-    StrategySBV encoding ->
-      let label = strategyLabel strat
-          solverCfg =
-            defaultSolveConfig
-              { scBackend = BackendSBV
-              , scTransitionEncoding = encoding
-              }
-       in StrategySpec
-            { ssName = T.unpack label
-            , ssConfig = object
-                [ "backend" .= ("sbv" :: T.Text)
-                , "transition" .= strategyKernelLabel encoding
-                ]
-            , ssSolveConfig = solverCfg
-            }
     StrategyDirectZ3 z3Enc ->
       StrategySpec
         { ssName = T.unpack (strategyLabel (StrategyDirectZ3 z3Enc))
@@ -362,7 +345,6 @@ strategySpecFrom strat =
             ]
         , ssSolveConfig = defaultSolveConfig
             { scBackend = BackendZ3PyClone
-            , scTransitionEncoding = UseEnum
             , scZ3TransitionEncoding = Z3TransitionLambda
             }
         }
@@ -623,26 +605,17 @@ columnFrom vals =
       [0 :: Int ..]
       vals
 
-strategyKernelLabel :: TransitionEncoding -> T.Text
-strategyKernelLabel UseLookup = "lookup"
-strategyKernelLabel UseLambda = "lambda"
-strategyKernelLabel UseEnum = "enum"
-
 z3TransitionKernelLabel :: Z3TransitionEncoding -> T.Text
 z3TransitionKernelLabel Z3TransitionLambda = "lambda"
 z3TransitionKernelLabel Z3TransitionLegacy = "legacy"
 
 strategyLabel :: SolverStrategy -> T.Text
-strategyLabel (StrategySBV enc) = "sbv_" <> strategyKernelLabel enc
 strategyLabel (StrategyDirectZ3 enc) = "z3_" <> z3TransitionKernelLabel enc
 strategyLabel StrategyPyClone = "z3_pyclone"
 
 parseStrategySingle :: String -> Either String SolverStrategy
 parseStrategySingle raw =
   case map toLower (trimSpaces raw) of
-    "lookup" -> Right (StrategySBV UseLookup)
-    "lambda" -> Right (StrategySBV UseLambda)
-    "enum" -> Right (StrategySBV UseEnum)
     "z3" -> Right (StrategyDirectZ3 Z3TransitionLambda)
     "direct" -> Right (StrategyDirectZ3 Z3TransitionLambda)
     "z3-direct" -> Right (StrategyDirectZ3 Z3TransitionLambda)
@@ -651,7 +624,7 @@ parseStrategySingle raw =
     "z3-subst" -> Right (StrategyDirectZ3 Z3TransitionLegacy)
     "pyclone" -> Right StrategyPyClone
     "z3-pyclone" -> Right StrategyPyClone
-    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, z3, z3-legacy, or pyclone)"
+    other -> Left $ "Unknown strategy: " <> other <> " (expected z3, z3-legacy, or pyclone)"
 
 parseStrategyList :: String -> Either String [SolverStrategy]
 parseStrategyList spec = traverse parseStrategySingle (splitCommaFields spec)

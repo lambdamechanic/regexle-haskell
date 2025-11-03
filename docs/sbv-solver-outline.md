@@ -1,5 +1,7 @@
-SBV Regexle Solver Outline
-==========================
+SBV Regexle Solver Outline (Archived)
+=====================================
+
+> **Status (November 3, 2025):** The SBV-based solver strategy was retired from `regexle-haskell` because the direct Z3 and PyClone backends are significantly faster and simpler to maintain. The notes below describe the original SBV plan for posterity.
 
 Objectives
 ----------
@@ -55,4 +57,3 @@ Open Questions / Follow-up Tasks
 - `regex-8`: Implement DFA-based pruning logic using `kleene` outputs.
 - `regex-9`: Build benchmarking harness comparable to Python's profile/matrix commands.
 - Evaluate performance of SBV encodings (ite ladder vs `SArray`); create benchmarks if gap discovered.
-

@@ -4,7 +4,6 @@ module Regexle.Solver
   ( SolveBackend (..)
   , SolveConfig (..)
   , SolveResult (..)
-  , TransitionEncoding (..)
   , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
@@ -36,29 +35,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import qualified Data.Vector as V
-import Data.Word (Word8, Word16)
-import Data.SBV
-  ( SWord16
-  , SWord8
-  , Symbolic
-  , constrain
-  , literal
-  , runSMTWith
-  , sWord16
-  , sWord8
-  , (.==)
-  , (./=)
-  , (.<=)
-  , (.||)
-  )
-import qualified Data.SBV as SBV
-import Data.SBV.Control
-  ( CheckSatResult (Sat, Unsat)
-  , checkSat
-  , getValue
-  , io
-  , query
-  )
+import Data.Word (Word8)
 import qualified Z3.Monad as Z3
 
 import Regexle.DFA
@@ -94,21 +71,16 @@ import System.IO.Unsafe (unsafePerformIO)
 -- Types and configuration
 -------------------------------------------------------------------------------
 
-data TransitionEncoding = UseLookup | UseLambda | UseEnum
-  deriving (Eq, Show, Enum, Bounded)
-
 data Z3TransitionEncoding = Z3TransitionLegacy | Z3TransitionLambda
   deriving (Eq, Show)
 
 data SolveBackend
-  = BackendSBV
-  | BackendZ3Direct
+  = BackendZ3Direct
   | BackendZ3PyClone
   deriving (Eq, Show)
 
 data SolveConfig = SolveConfig
   { scBackend :: !SolveBackend
-  , scTransitionEncoding :: !TransitionEncoding
   , scZ3TransitionEncoding :: !Z3TransitionEncoding
   }
   deriving (Eq, Show)
@@ -116,8 +88,7 @@ data SolveConfig = SolveConfig
 defaultSolveConfig :: SolveConfig
 defaultSolveConfig =
   SolveConfig
-    { scBackend = BackendSBV
-    , scTransitionEncoding = UseLambda
+    { scBackend = BackendZ3PyClone
     , scZ3TransitionEncoding = Z3TransitionLambda
     }
 
@@ -185,158 +156,16 @@ solvePuzzleWith cfg puzzle =
 solvePuzzleWithClues :: SolveConfig -> Puzzle -> [Clue] -> IO (Either String SolveResult)
 solvePuzzleWithClues cfg puzzle clues =
   case scBackend cfg of
-    BackendSBV -> solvePuzzleSBV (scTransitionEncoding cfg) puzzle clues
     BackendZ3Direct -> solvePuzzleZ3Direct (scZ3TransitionEncoding cfg) puzzle clues
     BackendZ3PyClone -> solvePuzzleZ3PyClone cfg puzzle clues
 
 solvePuzzlesHot :: SolveConfig -> [(Puzzle, [Clue])] -> IO [Either String SolveResult]
 solvePuzzlesHot cfg puzzlesWithClues =
   case scBackend cfg of
-    BackendSBV -> mapM (uncurry (solvePuzzleSBV (scTransitionEncoding cfg))) puzzlesWithClues
     BackendZ3Direct ->
       solvePuzzlesZ3DirectHot Nothing (scZ3TransitionEncoding cfg) puzzlesWithClues
     BackendZ3PyClone ->
       mapM (\(puzzle, clues) -> solvePuzzleZ3PyClone cfg puzzle clues) puzzlesWithClues
-
--------------------------------------------------------------------------------
--- SBV backend (existing implementation)
--------------------------------------------------------------------------------
-
-solvePuzzleSBV :: TransitionEncoding -> Puzzle -> [Clue] -> IO (Either String SolveResult)
-solvePuzzleSBV _encoding puzzle clues = do
-  buildStart <- getCurrentTime
-  resultOrErr <- (try $ runSMTWith SBV.z3{SBV.verbose = False} $ do
-    grid <- mkGrid (puzzleDiameter puzzle)
-    mapM_ constrainCellDomain (concat grid)
-    mapM_ (applyClue grid) clues
-    query $ do
-      solveStart <- io getCurrentTime
-      cs <- checkSat
-      solveEnd <- io getCurrentTime
-      case cs of
-        Sat -> do
-          model <- mapM (mapM getValue) grid
-          pure (Just model, solveStart, solveEnd)
-        Unsat -> pure (Nothing, solveStart, solveEnd)
-        _ -> pure (Nothing, solveStart, solveEnd)) :: IO (Either SomeException (Maybe [[Word8]], UTCTime, UTCTime))
-
-  case resultOrErr of
-    Left ex ->
-      pure (Left ("SBV solver failed: " ++ displayException ex))
-    Right (Nothing, _, _) ->
-      pure (Left "SBV solver reported UNSAT")
-    Right (Just model, solveStart, solveEnd) -> do
-      let buildTime = toSeconds (diffUTCTime solveStart buildStart)
-          solveTime = toSeconds (diffUTCTime solveEnd solveStart)
-          rendered = renderGrid puzzle model
-      pure (Right SolveResult {srGrid = rendered, srBuildTime = buildTime, srSolveTime = solveTime, srStats = Nothing})
-
-mkGrid :: Int -> Symbolic [[SWord8]]
-mkGrid dim =
-  forM [0 .. dim - 1] $ \x ->
-    forM [0 .. dim - 1] $ \y ->
-      sWord8 ("cell_" ++ show x ++ "_" ++ show y)
-
-constrainCellDomain :: SWord8 -> Symbolic ()
-constrainCellDomain cell =
-  let maxAlphabet = literal (fromIntegral (alphabetCardinality - 1) :: Word8)
-   in constrain (cell .<= maxAlphabet)
-
-applyClue :: [[SWord8]] -> Clue -> Symbolic ()
-applyClue grid clue = do
-  let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
-      dfaInfo = clueDfa clue
-  states <- mkStateVars (length chars) (clueAxis clue) (clueIndex clue)
-  restrictStates dfaInfo states
-  mapM_ (restrictDeadAlphabet dfaInfo) chars
-  case (states, chars) of
-    (st0 : _, firstChar : _) -> do
-      restrictInitial dfaInfo firstChar
-      constrain (st0 .== literalState (diInitial dfaInfo))
-    (st0 : _, []) ->
-      constrain (st0 .== literalState (diInitial dfaInfo))
-    _ -> pure ()
-  applyTransitions dfaInfo states chars
-  case lastMaybe states of
-    Just finalState -> constrain (acceptConstraint dfaInfo finalState)
-    Nothing -> pure ()
-
-mkStateVars :: Int -> Char -> Int -> Symbolic [SWord16]
-mkStateVars len axis idx =
-  forM [0 .. len] $ \i ->
-    sWord16 ("state_" ++ [axis] ++ "_" ++ show idx ++ "_" ++ show i)
-
-restrictStates :: DfaInfo -> [SWord16] -> Symbolic ()
-restrictStates info states = do
-  let transitions = diTransitions info
-      maxState =
-        if V.null transitions
-          then literalState 0
-          else literalState (V.length transitions - 1)
-      deadList = IntSet.toList (diDeadStates info)
-  forM_ states $ \st -> do
-    constrain (st .<= maxState)
-    forM_ deadList $ \d ->
-      constrain (st ./= literalState d)
-
-restrictInitial :: DfaInfo -> SWord8 -> Symbolic ()
-restrictInitial info firstChar = do
-  let deadFrom = diDeadFrom info
-      initialDead = if V.null deadFrom then IntSet.empty else deadFrom V.! diInitial info
-  forM_ (IntSet.toList initialDead) $ \idx ->
-    constrain (firstChar ./= literal (fromIntegral idx :: Word8))
-
-restrictDeadAlphabet :: DfaInfo -> SWord8 -> Symbolic ()
-restrictDeadAlphabet info cell =
-  forM_ (IntSet.toList (diDeadAlphabet info)) $ \idx ->
-    constrain (cell ./= literal (fromIntegral idx :: Word8))
-
-applyTransitionConstraint :: DfaInfo -> SWord16 -> (SWord8, SWord16) -> Symbolic ()
-applyTransitionConstraint info statePrev (ch, stateNext) = do
-  let expected = transitionLookup info statePrev ch
-  constrain (stateNext .== expected)
-
-applyTransitions :: DfaInfo -> [SWord16] -> [SWord8] -> Symbolic ()
-applyTransitions _ _ [] = pure ()
-applyTransitions _ [_] _ = pure ()
-applyTransitions info (prev:next:restStates) (ch:chs) = do
-  applyTransitionConstraint info prev (ch, next)
-  applyTransitions info (next:restStates) chs
-applyTransitions _ _ _ = pure ()
-
-acceptConstraint :: DfaInfo -> SWord16 -> SBV.SBool
-acceptConstraint info finalState =
-  case IntSet.toList (diAccepting info) of
-    [] -> SBV.literal False
-    xs ->
-      foldl'
-        (\acc v -> acc .|| (finalState .== literalState v))
-        (SBV.literal False)
-        xs
-
-transitionLookup :: DfaInfo -> SWord16 -> SWord8 -> SWord16
-transitionLookup info st ch =
-  foldr
-    (\(idx, row) acc ->
-        SBV.ite (st .== literalState idx)
-          (lookupRow row)
-          acc)
-    (literalState 0)
-    (zip [0 :: Int ..] (V.toList (diTransitions info)))
-  where
-    lookupRow row =
-      let defaultDest =
-            if V.null row then 0 else V.last row
-       in foldr
-            (\(cIdx, dst) acc ->
-                SBV.ite (ch .== literal (fromIntegral cIdx :: Word8))
-                  (literalState dst)
-                  acc)
-            (literalState defaultDest)
-            (zip [0 :: Int ..] (V.toList row))
-
-literalState :: Int -> SWord16
-literalState n = literal (fromIntegral n :: Word16)
 
 -------------------------------------------------------------------------------
 -- Direct Z3 backend

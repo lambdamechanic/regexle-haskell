@@ -1,6 +1,5 @@
 packages:
   .
-  third_party/sbv-fork
   z3-415.3
 
 source-repository-package
