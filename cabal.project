@@ -1,4 +1,5 @@
 packages:
   .
+  kleene-0.1
   third_party/sbv-fork
   z3-415.3
