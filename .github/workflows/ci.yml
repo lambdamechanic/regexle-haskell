@@ -15,6 +15,7 @@ jobs:
           submodules: true
 
       - name: Set up Haskell
+        id: setup-haskell
         uses: haskell-actions/setup@v2.8.2
         with:
           ghc-version: "9.12.2"
@@ -29,6 +30,15 @@ jobs:
           key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
           restore-keys: |
             ${{ runner.os }}-cabal-
+
+      - name: Cache dist-newstyle
+        uses: actions/cache@v4
+        with:
+          path: dist-newstyle
+          key: ${{ runner.os }}-ghc-${{ steps.setup-haskell.outputs.ghc-version }}-dist-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
+          restore-keys: |
+            ${{ runner.os }}-ghc-${{ steps.setup-haskell.outputs.ghc-version }}-dist-
+            ${{ runner.os }}-dist-
 
       - name: Update cabal package index
         run: cabal update
