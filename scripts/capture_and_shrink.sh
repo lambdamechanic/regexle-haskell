@@ -10,6 +10,7 @@ DUMP_ROOT=${1:-stats}
 CAPTURE_SCRIPT=$(dirname "$0")/capture_segfault_dump.sh
 SHRINK_SCRIPT=$(dirname "$0")/run_replay_test.sh
 SHRINKRAY_SEED=${SHRINKRAY_SEED:-7}
+SHRINKRAY_TIMEOUT=${SHRINKRAY_TIMEOUT:-5}
 
 if ! command -v shrinkray >/dev/null 2>&1; then
   echo "ERROR: shrinkray not found on PATH" >&2
@@ -64,7 +65,7 @@ cp -R "$DUMP_DIR" "$WORK_DIR"
 
 echo "[3/3] Shrinking dump in $WORK_DIR"
 shrinkray --ui=basic --formatter=none --volume=quiet \
-  --in-place --input-type=arg --parallelism=1 --timeout=5 --seed "$SHRINKRAY_SEED" \
+  --in-place --input-type=arg --parallelism=1 --timeout="$SHRINKRAY_TIMEOUT" --seed "$SHRINKRAY_SEED" \
   "$SHRINK_SCRIPT" "$WORK_DIR"
 
 echo "Shrink complete. Reduced corpus lives at $WORK_DIR"

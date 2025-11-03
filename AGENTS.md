@@ -95,6 +95,10 @@ Then use `mcp__beads__*` functions instead of CLI commands.
 - ❌ Do NOT use external issue trackers
 - ❌ Do NOT duplicate tracking systems
 
+### Benchmarking Discipline
+
+- When a change improves solver performance (build/solve times), record the exact git commit alongside the measurement. Update the relevant JSON/JSONL benchmark artifacts so future agents know which revision produced each data point.
+
 For more details, see README.md and QUICKSTART.md.
 
 ### Git Remotes

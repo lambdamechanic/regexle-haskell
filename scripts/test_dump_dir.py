@@ -56,8 +56,12 @@ def run(binary: Path, dump_dir: Path, timeout: float) -> int:
     except subprocess.TimeoutExpired:
         return 1
 
+    stderr_text = proc.stderr.decode(errors="ignore")
     if proc.returncode == -signal.SIGSEGV:
-        sys.stderr.write(proc.stderr.decode(errors="ignore"))
+        sys.stderr.write(stderr_text)
+        return 0
+    if proc.returncode != 0 and "assertion violation" in stderr_text.lower():
+        sys.stderr.write(stderr_text)
         return 0
     return 1
 

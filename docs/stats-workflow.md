@@ -23,6 +23,23 @@ Toggles to remember:
 
 Each profile writes a columnar JSON blob with build/solve timings per puzzle plus `_meta.wall_time_seconds` for the whole sweep.
 
+### Puzzle snapshots
+
+The generator endpoint at `https://generator.regexle.com` may drift as new puzzle variants are published. To keep performance sweeps reproducible we mirror the SMT dumps that produced the October 27, 2025 hot benchmark results. The canonical copies live under:
+
+```
+benchmarks/smt/side3-400-409/
+```
+
+That directory contains `base.smt2` plus `puzzle-0400.smt2` … `puzzle-0409.smt2`. Use them whenever you need to replay the legacy “6 ms” slice, e.g.
+
+```bash
+cd benchmarks/smt/side3-400-409
+../../z3-415.3/vendor/z3-4.15.3/bin/z3 -nw -st driver.smt2
+```
+
+If you regenerate fresh dumps for new baselines, copy them into a sibling directory (e.g. `benchmarks/smt/side3-410-419/`) rather than overwriting these pinned artifacts.
+
 ## 2. Summarize into the combined table
 
 Every line in `stats/combined-benchmark-table.jsonl` is a hand-curated JSON object. The helper snippet below derives the numeric columns directly from a profile artifact and prints a ready-to-append row:

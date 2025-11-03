@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "regex-12-Z3-port" ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Haskell
+        uses: haskell/actions/setup@v2
+        with:
+          ghc-version: "9.12.2"
+          cabal-version: "3.12.1.0"
+
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
+          restore-keys: |
+            ${{ runner.os }}-cabal-
+
+      - name: Update cabal package index
+        run: cabal update
+
+      - name: Build
+        run: cabal build --enable-tests
+
+      - name: Test
+        run: cabal test --enable-tests

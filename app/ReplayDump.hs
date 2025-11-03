@@ -4,11 +4,12 @@ module Main where
 
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.State.Strict (StateT, evalStateT, gets, modify)
+import Control.Monad.State.Strict (StateT, evalStateT, get, gets, modify)
 import Control.Monad.Trans.Class (lift)
 import Data.Char (isSpace)
 import Data.List (sort)
 import qualified Data.Map.Strict as M
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -82,6 +83,12 @@ splitCommands input = go [] [] 0 False (T.unpack input)
 
 data SExpr = Atom Text | List [SExpr]
   deriving (Show, Eq)
+
+collectAtoms :: SExpr -> [Text]
+collectAtoms sexpr = Set.toList (go sexpr Set.empty)
+  where
+    go (Atom t) acc = Set.insert t acc
+    go (List xs) acc = foldr go acc xs
 
 tokenize :: Text -> [Text]
 tokenize = go [] [] . T.unpack
@@ -157,6 +164,8 @@ parseCommand txt =
 data HarnessState = HarnessState
   { hsSorts :: !(M.Map Text Z3.Sort)
   , hsDecls :: !(M.Map Text Z3.FuncDecl)
+  , hsCtorDecls :: ![(Text, Z3.FuncDecl)]
+  , hsSeenCtorNames :: !(Set.Set Text)
   , hsConstAsts :: !(M.Map Text Z3.AST)
   , hsCurrentModel :: !(Maybe Z3.Model)
   , hsVerbose :: !Bool
@@ -166,6 +175,8 @@ initialState :: Bool -> HarnessState
 initialState verbose = HarnessState
   { hsSorts = M.empty
   , hsDecls = M.empty
+  , hsCtorDecls = []
+  , hsSeenCtorNames = Set.empty
   , hsConstAsts = M.empty
   , hsCurrentModel = Nothing
   , hsVerbose = verbose
@@ -188,7 +199,9 @@ runCommands files = forM_ files $ \(path, commands) -> do
     modify' f = modify f
 
 execCommand :: Command -> StateT HarnessState Z3.Z3 ()
-execCommand cmd =
+execCommand cmd = do
+  v <- gets hsVerbose
+  when v $ liftIO (print cmd)
   case cmd of
     CmdPush -> z3 Z3.solverPush
     CmdPop -> z3 (Z3.solverPop 1)
@@ -226,13 +239,40 @@ lookupConstAst name = do
 
 addAssert :: Text -> StateT HarnessState Z3.Z3 ()
 addAssert txt = do
-  sortEntries <- M.toList <$> gets hsSorts
-  declEntries <- M.toList <$> gets hsDecls
+  st <- get
+  let sortEntries = M.toList (hsSorts st)
+      referenced = case parseSExpr txt of
+        Left _ -> Nothing
+        Right sexpr -> Just (collectAtoms sexpr)
+      baseDecls =
+        let entries = M.toList (hsDecls st)
+         in case referenced of
+              Nothing -> entries
+              Just names -> filter (\(name, _) -> name `elem` names) entries
+      ctorDecls =
+        let entries = hsCtorDecls st
+         in case referenced of
+              Nothing -> entries
+              Just names -> filter (\(name, _) -> name `elem` names) entries
+      seenCtors = hsSeenCtorNames st
+      (newCtorDecls, _) = foldr
+        (\entry@(name, _) (fresh, accSeen) ->
+            if Set.member name accSeen
+              then (fresh, accSeen)
+              else (entry : fresh, Set.insert name accSeen))
+        ([], seenCtors)
+        ctorDecls
+      declEntries = baseDecls ++ newCtorDecls
   let (sortNames, sortRefs) = unzip [(name, sort) | (name, sort) <- sortEntries]
-      (declNames, declRefs) = unzip [(name, decl) | (name, decl) <- declEntries]
+      (declNames, declRefs) = unzip declEntries
+  v <- gets hsVerbose
+  when v $ liftIO $
+    putStrLn ("assert refs: sorts=" <> show sortNames <> " decls=" <> show (take 10 declNames))
   sortSymbols <- mapM (z3 . Z3.mkStringSymbol . T.unpack) sortNames
   declSymbols <- mapM (z3 . Z3.mkStringSymbol . T.unpack) declNames
   ast <- z3 $ Z3.parseSMTLib2String (T.unpack txt) sortSymbols sortRefs declSymbols declRefs
+  modify $ \st' ->
+    st' { hsSeenCtorNames = foldr Set.insert (hsSeenCtorNames st') (map fst newCtorDecls) }
   z3 $ Z3.solverAssertCnstr ast
 
 declareDatatype :: (Text, [Text]) -> StateT HarnessState Z3.Z3 ()
@@ -240,7 +280,15 @@ declareDatatype (sortName, ctors) = do
   sym <- z3 $ Z3.mkStringSymbol (T.unpack sortName)
   constructors <- mapM mkCtor ctors
   sort <- z3 $ Z3.mkDatatype sym constructors
-  modify $ \st -> st { hsSorts = M.insert sortName sort (hsSorts st) }
+  ctorDecls <- z3 $ Z3.getDatatypeSortConstructors sort
+  let ctorPairs = zip ctors ctorDecls
+  modify $ \st ->
+    let seen' = foldr Set.insert (hsSeenCtorNames st) (map fst ctorPairs)
+     in st
+          { hsSorts = M.insert sortName sort (hsSorts st)
+          , hsCtorDecls = hsCtorDecls st ++ ctorPairs
+          , hsSeenCtorNames = seen'
+          }
   where
     mkCtor ctorName = do
       ctorSym <- z3 $ Z3.mkStringSymbol (T.unpack ctorName)

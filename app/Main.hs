@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Control.Exception (SomeException, catch)
 import Control.Monad (forM, forM_, when)
 import qualified Data.Map.Strict as Map
 import Data.Aeson (ToJSON, Value (Null), encode, object, (.=), toJSON)
@@ -26,6 +27,7 @@ import Regexle.Solver
   , Z3TransitionEncoding (..)
   , defaultSolveConfig
   , buildClues
+  , buildCluesCached
   , solvePuzzleWith
   , solvePuzzleWithClues
   , solvePuzzlesHot
@@ -33,6 +35,7 @@ import Regexle.Solver
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
+import System.Process (readProcess)
 
 main :: IO ()
 main = do
@@ -59,6 +62,7 @@ data FetchOptions = FetchOptions
 data SolverStrategy
   = StrategySBV TransitionEncoding
   | StrategyDirectZ3 !Z3TransitionEncoding
+  | StrategyPyClone
   deriving (Eq, Show)
 
 data MatrixOptions = MatrixOptions
@@ -153,7 +157,7 @@ matrixOptionsParser =
       (eitherReader parseStrategyList)
       ( long "strategies"
           <> metavar "LIST"
-          <> help "Comma list of solver strategies (lookup,lambda,enum,z3,z3-legacy)"
+          <> help "Comma list of solver strategies (lookup,lambda,enum,z3,z3-legacy,pyclone)"
           <> value [StrategySBV UseLookup, StrategySBV UseLambda, StrategyDirectZ3 Z3TransitionLambda]
           <> showDefaultWith (const "lookup,lambda,z3")
       )
@@ -193,7 +197,7 @@ profileOptionsParser =
       (eitherReader parseStrategySingle)
       ( long "strategy"
           <> metavar "NAME"
-          <> help "Solver strategy (lookup, lambda, enum, z3, or z3-legacy)"
+          <> help "Solver strategy (lookup, lambda, enum, z3, z3-legacy, or pyclone)"
           <> showDefaultWith (const "lambda")
           <> value (StrategySBV UseLambda)
       )
@@ -348,6 +352,20 @@ strategySpecFrom strat =
             , scZ3TransitionEncoding = z3Enc
             }
         }
+    StrategyPyClone ->
+      StrategySpec
+        { ssName = T.unpack (strategyLabel StrategyPyClone)
+        , ssConfig = object
+            [ "backend" .= ("z3_pyclone" :: T.Text)
+            , "transition" .= ("lambda" :: T.Text)
+            , "dfa_cache" .= True
+            ]
+        , ssSolveConfig = defaultSolveConfig
+            { scBackend = BackendZ3PyClone
+            , scTransitionEncoding = UseEnum
+            , scZ3TransitionEncoding = Z3TransitionLambda
+            }
+        }
 
 matrixEntry :: Puzzle -> StrategySpec -> IO Value
 matrixEntry puzzle spec = do
@@ -403,9 +421,16 @@ runProfile ProfileOptions { poSide = side
 
   puzzleEntries <- forM days $ \day -> do
     puzzle <- fetchPuzzle day side
-    case buildClues puzzle of
-      Left err -> pure (day, Left err)
-      Right clues -> pure (day, Right (puzzle, clues))
+    if scBackend solverCfg == BackendZ3PyClone
+      then do
+        cached <- buildCluesCached puzzle
+        case cached of
+          Left err -> pure (day, Left err)
+          Right clues -> pure (day, Right (puzzle, clues))
+      else
+        case buildClues puzzle of
+          Left err -> pure (day, Left err)
+          Right clues -> pure (day, Right (puzzle, clues))
 
   let jobs = [ (day, puzzle, clues) | (day, Right (puzzle, clues)) <- puzzleEntries ]
 
@@ -415,9 +440,13 @@ runProfile ProfileOptions { poSide = side
     if null jobs
       then pure []
       else
-        if useHot
-          then solvePuzzlesHot solverCfg (map (\(_, puzzle, clues) -> (puzzle, clues)) jobs)
-          else mapM (\(_, puzzle, clues) -> solvePuzzleWithClues solverCfg puzzle clues) jobs
+        case scBackend solverCfg of
+          BackendZ3PyClone ->
+            mapM (\(_, puzzle, _) -> solvePuzzleWith solverCfg puzzle) jobs
+          _ ->
+            if useHot
+              then solvePuzzlesHot solverCfg (map (\(_, puzzle, clues) -> (puzzle, clues)) jobs)
+              else mapM (\(_, puzzle, clues) -> solvePuzzleWithClues solverCfg puzzle clues) jobs
 
   overallEnd <- getCurrentTime
 
@@ -485,6 +514,8 @@ runProfile ProfileOptions { poSide = side
         | (day, entry) <- puzzleEntries
         ]
 
+  commitTag <- getGitRevisionTag
+
   let totalRuns = length rows
       buildSamples = catMaybes (map prBuildTime rows)
       solveSamples = catMaybes (map prSolveTime rows)
@@ -492,7 +523,7 @@ runProfile ProfileOptions { poSide = side
       avgBuild = average buildSamples
       avgSolve = average solveSamples
       wallSeconds = toSeconds (diffUTCTime overallEnd overallStart)
-      jsonValue = profileToJson rows wallSeconds
+      jsonValue = profileToJson rows wallSeconds commitTag
 
   let outDir = takeDirectory outputPath
   createDirectoryIfMissing True outDir
@@ -527,6 +558,21 @@ runProfile ProfileOptions { poSide = side
     statsValue Nothing = object []
     statsValue (Just txt) = object ["raw" .= txt]
 
+getGitRevisionTag :: IO T.Text
+getGitRevisionTag =
+  catch action fallback
+  where
+    action = do
+      hashRaw <- readProcess "git" ["rev-parse", "HEAD"] ""
+      status <- readProcess "git" ["status", "--porcelain"] ""
+      let hash = trim hashRaw
+          dirty = any (not . isSpace) status
+          tag = if dirty then "DIRTY " ++ hash else hash
+      pure (T.pack tag)
+    fallback :: SomeException -> IO T.Text
+    fallback _ = pure "UNKNOWN"
+    trim = dropWhileEnd isSpace . dropWhile isSpace
+
 data ProfileRow = ProfileRow
   { prSide :: !Int
   , prDay :: !Int
@@ -540,14 +586,15 @@ data ProfileRow = ProfileRow
   , prZ3Stats :: !Value
   }
 
-profileToJson :: [ProfileRow] -> Double -> Value
-profileToJson rows wallSeconds =
+profileToJson :: [ProfileRow] -> Double -> T.Text -> Value
+profileToJson rows wallSeconds gitTag =
   object
     ( columnPayload
         ++ [ "_meta"
              .= object
                 [ "wall_time_seconds" .= wallSeconds
                 , "rows" .= length rows
+                , "git_commit" .= gitTag
                 ]
            ]
     )
@@ -588,6 +635,7 @@ z3TransitionKernelLabel Z3TransitionLegacy = "legacy"
 strategyLabel :: SolverStrategy -> T.Text
 strategyLabel (StrategySBV enc) = "sbv_" <> strategyKernelLabel enc
 strategyLabel (StrategyDirectZ3 enc) = "z3_" <> z3TransitionKernelLabel enc
+strategyLabel StrategyPyClone = "z3_pyclone"
 
 parseStrategySingle :: String -> Either String SolverStrategy
 parseStrategySingle raw =
@@ -601,7 +649,9 @@ parseStrategySingle raw =
     "z3-lambda" -> Right (StrategyDirectZ3 Z3TransitionLambda)
     "z3-legacy" -> Right (StrategyDirectZ3 Z3TransitionLegacy)
     "z3-subst" -> Right (StrategyDirectZ3 Z3TransitionLegacy)
-    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, z3, or z3-legacy)"
+    "pyclone" -> Right StrategyPyClone
+    "z3-pyclone" -> Right StrategyPyClone
+    other -> Left $ "Unknown strategy: " <> other <> " (expected lookup, lambda, enum, z3, z3-legacy, or pyclone)"
 
 parseStrategyList :: String -> Either String [SolverStrategy]
 parseStrategyList spec = traverse parseStrategySingle (splitCommaFields spec)
