@@ -466,21 +466,18 @@ solvePuzzleZ3PyClone _cfg puzzle clues = do
   resultOrErr <- (try $ Z3.evalZ3 $ do
     alphabetDomain <- mkAlphabetDomain alphabetCardinality
     stateDomain <- mkStateDomain "PyClone" globalStateCount
-    goal <- Z3.mkGoal True False False
     liftIO (writeIORef stageRef "mkGrid")
     let dim = puzzleDiameter puzzle
     grid <- mkGridZ3 alphabetDomain dim
     alphabetBanRef <- liftIO (newIORef IntMap.empty)
     stateBanRef <- liftIO (newIORef Map.empty)
-    let emitBounds = Z3.goalAssert goal
+    let emitBounds = csEmit solverSink
     forM_ grid $ \row ->
       forM_ row $ \cell ->
         assertAlphabetBounds emitBounds alphabetDomain cell
     forM_ clues $ \clue -> do
       liftIO (writeIORef stageRef ("clue " ++ clueLabel clue))
-      applyClueZ3PyClone goal dim alphabetBanRef stateBanRef alphabetDomain stateDomain grid clue
-    formulas <- Z3.getGoalFormulas goal
-    mapM_ Z3.solverAssertCnstr formulas
+      applyClueZ3PyClone dim alphabetBanRef stateBanRef alphabetDomain stateDomain grid clue
     liftIO (writeIORef stageRef "solverCheck")
     mDump <- liftIO (lookupEnv "REGEXLE_PYCLONE_DUMP_DIR")
     forM_ mDump $ \dir -> do
@@ -634,8 +631,8 @@ mkGridZ3 alphabetDomain dim =
     forM [0 .. dim - 1] $ \y ->
       Z3.mkFreshConst ("cell_" ++ show x ++ "_" ++ show y) (adSort alphabetDomain)
 
-applyClueZ3PyClone :: Z3Base.Goal -> Int -> IORef (IntMap.IntMap IntSet.IntSet) -> IORef StateBanCache -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
-applyClueZ3PyClone goal dim alphabetBansRef stateBansRef alphabetDomain stateDomain grid clue = do
+applyClueZ3PyClone :: Int -> IORef (IntMap.IntMap IntSet.IntSet) -> IORef StateBanCache -> AlphabetDomain -> StateDomain -> [[Z3.AST]] -> Clue -> Z3.Z3 ()
+applyClueZ3PyClone dim alphabetBansRef stateBansRef alphabetDomain stateDomain grid clue = do
   let chars = map (\(x, y) -> grid !! x !! y) (clueCoords clue)
       indexedChars = zip (clueCoords clue) chars
       info = clueDfa clue
@@ -679,6 +676,7 @@ applyClueZ3PyClone goal dim alphabetBansRef stateBansRef alphabetDomain stateDom
         , idx < stateCount
         ]
       bannedStateIdxs = IntSet.toList (IntSet.fromList deadStateIdxs)
+      emit = csEmit solverSink
   when pycloneDebug $ liftIO $ do
     hPutStrLn stderr $ printf
       "pyclone clue %c%d len=%d states=%d deadAlpha=%d deadInit=%d deadStates=%d alphaDomain=%d stateDomain=%d estBannedNeq=%d"
@@ -694,9 +692,7 @@ applyClueZ3PyClone goal dim alphabetBansRef stateBansRef alphabetDomain stateDom
       diseqEstimate
   transitionFn <- buildTransitionFunction Z3TransitionLambda stateDomain alphabetDomain info
   states <- mkStateVarsZ3 solverSink stateDomain (length chars) (clueAxis clue) (clueIndex clue)
-  let goalSink = ConstraintSink { csEmit = Z3.goalAssert goal, csDeclare = const (pure ()) }
-      emit ast = Z3.goalAssert goal ast
-      stateKey offset = StateBanKey (clueAxis clue) (clueIndex clue) offset
+  let stateKey offset = StateBanKey (clueAxis clue) (clueIndex clue) offset
   forM_ (zip [0 ..] states) $ \(stateOffset, st) -> do
     assertStateBounds emit stateCount st
     newStateBans <- liftIO $ recordStateBans (stateKey stateOffset) bannedStateIdxs
@@ -725,9 +721,9 @@ applyClueZ3PyClone goal dim alphabetBansRef stateBansRef alphabetDomain stateDom
       eq <- Z3.mkEq st0 initLit
       emit eq
     _ -> pure ()
-  applyTransitionsZ3 goalSink transitionFn states chars
+  applyTransitionsZ3 solverSink transitionFn states chars
   case lastMaybe states of
-    Just finalState -> assertAcceptStateZ3 goalSink stateDomain info finalState
+    Just finalState -> assertAcceptStateZ3 solverSink stateDomain info finalState
     Nothing -> pure ()
   where
     mkDistinctNeq a b = Z3.mkDistinct [a, b]

@@ -20,7 +20,7 @@ import Regexle.Solver
   , mkStateDomain
   )
 import Test.Syd
-import qualified Z3.Monad as Z3 (astToString, evalZ3, getGoalFormulas, mkGoal)
+import qualified Z3.Monad as Z3 (evalZ3, solverToString)
 
 spec :: Spec
 spec = describe "PyClone deduplication" $ do
@@ -39,14 +39,13 @@ spec = describe "PyClone deduplication" $ do
           stateCount = max 1 (V.length (diTransitions info))
       alphabetDomain <- mkAlphabetDomain alphabetCardinality
       stateDomain <- mkStateDomain "PyCloneTest" stateCount
-      goal <- Z3.mkGoal True False False
       grid <- mkGridZ3 alphabetDomain dim
-      applyClueZ3PyClone goal dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
-      applyClueZ3PyClone goal dim alphabetRef stateRef alphabetDomain stateDomain grid clueY
-      formulas <- Z3.getGoalFormulas goal
-      strings <- traverse Z3.astToString formulas
+      applyClueZ3PyClone dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
+      applyClueZ3PyClone dim alphabetRef stateRef alphabetDomain stateDomain grid clueY
+      solverText <- Z3.solverToString
       let isCellDistinct s = "(distinct" `List.isInfixOf` s && "cell_0_0" `List.isInfixOf` s
-      pure (length (filter isCellDistinct strings))
+          linesWithDistinct = filter isCellDistinct (lines solverText)
+      pure (length linesWithDistinct)
     distinctCount `shouldBe` expectedDistinct
 
   it "avoids re-adding identical state bans when a clue is applied twice" $ do
@@ -68,14 +67,13 @@ spec = describe "PyClone deduplication" $ do
       let dim = puzzleDiameter testPuzzle
       alphabetDomain <- mkAlphabetDomain alphabetCardinality
       stateDomain <- mkStateDomain "PyCloneState" stateCount
-      goal <- Z3.mkGoal True False False
       grid <- mkGridZ3 alphabetDomain dim
-      applyClueZ3PyClone goal dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
-      applyClueZ3PyClone goal dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
-      formulas <- Z3.getGoalFormulas goal
-      strings <- traverse Z3.astToString formulas
+      applyClueZ3PyClone dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
+      applyClueZ3PyClone dim alphabetRef stateRef alphabetDomain stateDomain grid clueX
+      solverText <- Z3.solverToString
       let isStateDistinct s = "(distinct" `List.isInfixOf` s && "state_x_0_" `List.isInfixOf` s
-      pure (length (filter isStateDistinct strings))
+          linesWithDistinct = filter isStateDistinct (lines solverText)
+      pure (length linesWithDistinct)
     distinctCount `shouldBe` expectedDistinct
 
 buildTestClues :: IO (Clue, Clue, Clue)
