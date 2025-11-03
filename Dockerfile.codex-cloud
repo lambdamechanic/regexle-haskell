@@ -1,0 +1,13 @@
+FROM ghcr.io/openai/codex-universal:latest
+
+SHELL ["/bin/bash", "-c"]
+
+COPY scripts/codex-cloud-fastmirror.sh /tmp/codex-cloud-fastmirror.sh
+COPY scripts/codex-cloud-setup.sh /tmp/codex-cloud-setup.sh
+COPY scripts/codex-cloud-maintenance.sh /tmp/codex-cloud-maintenance.sh
+
+RUN chmod +x /tmp/codex-cloud-fastmirror.sh /tmp/codex-cloud-setup.sh /tmp/codex-cloud-maintenance.sh && \
+    /tmp/codex-cloud-fastmirror.sh && \
+    /tmp/codex-cloud-setup.sh && \
+    /tmp/codex-cloud-maintenance.sh && \
+    rm -f /tmp/codex-cloud-fastmirror.sh /tmp/codex-cloud-setup.sh /tmp/codex-cloud-maintenance.sh
