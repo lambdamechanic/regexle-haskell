@@ -1,5 +1,9 @@
 packages:
   .
-  kleene-0.1
   third_party/sbv-fork
   z3-415.3
+
+source-repository-package
+  type: git
+  location: https://github.com/lambdamechanic/kleene.git
+  tag: 22e780cd594f7a4b95dbb4ba6b46e1a3cea4e9f7
