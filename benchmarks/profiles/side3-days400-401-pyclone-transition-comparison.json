@@ -1,0 +1,174 @@
+{
+  "_meta": {
+    "description": "Side 3 days 400..401 PyClone transition lambda benchmark before/after guarding the fallback branch",
+    "created_utc": "2025-11-03T09:24:02.508417Z",
+    "command": "cabal run regexle-haskell -- profile --side 3 --days 400..401 --strategy pyclone --output <file>",
+    "notes": "Guarded run includes regex-35 lambda fallback fix (commit 62e1fd5). Baseline run is previous commit a7ba800."
+  },
+  "runs": [
+    {
+      "label": "baseline",
+      "summary": {
+        "git_commit": "a7ba800f58933da85013e4a8d952411b5965d882",
+        "rows": 2,
+        "wall_time_seconds": 0.190662939,
+        "avg_build_time_seconds": 0.075118382,
+        "avg_solve_time_seconds": 0.020028210999999997,
+        "total_time_seconds": 0.190293186
+      },
+      "profile": {
+        "_meta": {
+          "git_commit": "a7ba800f58933da85013e4a8d952411b5965d882",
+          "rows": 2,
+          "wall_time_seconds": 0.190662939
+        },
+        "build_time": {
+          "0": 0.076168085,
+          "1": 0.074068679
+        },
+        "day": {
+          "0": 400,
+          "1": 401
+        },
+        "error": {
+          "0": null,
+          "1": null
+        },
+        "side": {
+          "0": 3,
+          "1": 3
+        },
+        "solution": {
+          "0": [
+            "WRW  ",
+            "PQDF ",
+            "OLLZD",
+            " AZXR",
+            "  JYU"
+          ],
+          "1": [
+            "AIE  ",
+            "MEHC ",
+            "TAYHV",
+            " WEUH",
+            "  PHH"
+          ]
+        },
+        "solve_time": {
+          "0": 0.021949298,
+          "1": 0.018107124
+        },
+        "strategy": {
+          "0": "z3_pyclone",
+          "1": "z3_pyclone"
+        },
+        "strategy_config": {
+          "0": {
+            "backend": "z3_pyclone",
+            "dfa_cache": true,
+            "transition": "lambda"
+          },
+          "1": {
+            "backend": "z3_pyclone",
+            "dfa_cache": true,
+            "transition": "lambda"
+          }
+        },
+        "total_time": {
+          "0": 0.098117383,
+          "1": 0.092175803
+        },
+        "z3_stats": {
+          "0": {
+            "raw": "(:added-eqs                      26\n :arith-eq-adapter               24\n :arith-bound-propagations-cheap 43\n :arith-diseq                    42\n :arith-lower                    44\n :arith-make-feasible            6\n :arith-max-columns              33\n :arith-propagations             43\n :arith-upper                    13\n :binary-propagations            40\n :decisions                      4\n :del-clause                     2\n :eliminated-vars                90\n :final-checks                   1\n :max-memory                     20.13\n :memory                         19.46\n :mk-bool-var                    109\n :mk-clause                      60\n :num-allocs                     1121860\n :num-checks                     1\n :propagations                   47\n :rlimit-count                   87877\n :time                           0.02)"
+          },
+          "1": {
+            "raw": "(:arith-lower         6\n :arith-make-feasible 1\n :arith-max-columns   10\n :arith-upper         6\n :eliminated-vars     91\n :final-checks        1\n :max-memory          38.37\n :memory              19.39\n :mk-bool-var         12\n :num-allocs          7377324\n :num-checks          1\n :rlimit-count        82803\n :time                0.02)"
+          }
+        }
+      }
+    },
+    {
+      "label": "guarded",
+      "summary": {
+        "git_commit": "62e1fd58b39677c55d44cf1944f653ec0d9d2783",
+        "rows": 2,
+        "wall_time_seconds": 0.204819788,
+        "avg_build_time_seconds": 0.0806249055,
+        "avg_solve_time_seconds": 0.021630622000000002,
+        "total_time_seconds": 0.204511055
+      },
+      "profile": {
+        "_meta": {
+          "git_commit": "62e1fd58b39677c55d44cf1944f653ec0d9d2783",
+          "rows": 2,
+          "wall_time_seconds": 0.204819788
+        },
+        "build_time": {
+          "0": 0.086784166,
+          "1": 0.074465645
+        },
+        "day": {
+          "0": 400,
+          "1": 401
+        },
+        "error": {
+          "0": null,
+          "1": null
+        },
+        "side": {
+          "0": 3,
+          "1": 3
+        },
+        "solution": {
+          "0": [
+            "WRW  ",
+            "PQDF ",
+            "OLLZD",
+            " AZXR",
+            "  JYU"
+          ],
+          "1": [
+            "AIE  ",
+            "MEHC ",
+            "TAYHV",
+            " WEUH",
+            "  PHH"
+          ]
+        },
+        "solve_time": {
+          "0": 0.026511208,
+          "1": 0.016750036
+        },
+        "strategy": {
+          "0": "z3_pyclone",
+          "1": "z3_pyclone"
+        },
+        "strategy_config": {
+          "0": {
+            "backend": "z3_pyclone",
+            "dfa_cache": true,
+            "transition": "lambda"
+          },
+          "1": {
+            "backend": "z3_pyclone",
+            "dfa_cache": true,
+            "transition": "lambda"
+          }
+        },
+        "total_time": {
+          "0": 0.113295374,
+          "1": 0.09121568099999999
+        },
+        "z3_stats": {
+          "0": {
+            "raw": "(:added-eqs                      136\n :arith-eq-adapter               102\n :arith-bound-propagations-cheap 200\n :arith-diseq                    200\n :arith-fixed-eqs                2\n :arith-lower                    72\n :arith-make-feasible            4\n :arith-max-columns              38\n :arith-propagations             200\n :arith-upper                    148\n :binary-propagations            133\n :decisions                      3\n :del-clause                     77\n :eliminated-vars                87\n :final-checks                   1\n :max-memory                     20.47\n :memory                         19.55\n :mk-bool-var                    426\n :mk-clause                      144\n :num-allocs                     1706501\n :num-checks                     1\n :propagations                   203\n :rlimit-count                   100442\n :time                           0.03)"
+          },
+          "1": {
+            "raw": "(:arith-lower         6\n :arith-make-feasible 1\n :arith-max-columns   10\n :arith-upper         6\n :eliminated-vars     91\n :final-checks        1\n :max-memory          38.39\n :memory              19.35\n :mk-bool-var         12\n :num-allocs          8732116\n :num-checks          1\n :rlimit-count        83917\n :time                0.02)"
+          }
+        }
+      }
+    }
+  ]
+}
