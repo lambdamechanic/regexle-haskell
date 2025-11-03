@@ -7,3 +7,4 @@ kleene-0.1/
 stats/
 .beads/issues.jsonl
 .beads/daemon.*
+.nix-attic-token

@@ -8,43 +8,49 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NIX_CONFIG: |
+        experimental-features = nix-command flakes
+        accept-flake-config = true
+        extra-substituters = https://attic.app.lambdamechanic.com/lambdamechanic-main https://cache.nixos.org/
+        extra-trusted-public-keys = lambdamechanic-main:5wNxMhT/4Jdev6LshHRyV7B3YTQZzfj+e8dyWDFyoNU= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+      ATTIC_CACHE: lambdamechanic-main
+      ATTIC_ENDPOINT: https://attic.app.lambdamechanic.com/
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Set up Haskell
-        id: setup-haskell
-        uses: haskell-actions/setup@v2.8.2
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
         with:
-          ghc-version: "9.12.2"
-          cabal-version: "3.16.0.0"
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
 
-      - name: Cache cabal store
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cabal/packages
-            ~/.cabal/store
-          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
-          restore-keys: |
-            ${{ runner.os }}-cabal-
+      - name: Validate Attic secret
+        run: |
+          if [ -z "${ATTIC_TOKEN}" ]; then
+            echo "ATTIC_TOKEN is required for cached builds" >&2
+            exit 1
+          fi
 
-      - name: Cache dist-newstyle
-        uses: actions/cache@v4
-        with:
-          path: dist-newstyle
-          key: ${{ runner.os }}-ghc-${{ steps.setup-haskell.outputs.ghc-version }}-dist-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
-          restore-keys: |
-            ${{ runner.os }}-ghc-${{ steps.setup-haskell.outputs.ghc-version }}-dist-
-            ${{ runner.os }}-dist-
+      - name: Configure Attic cache
+        run: |
+          nix run github:zhaofengli/attic#default -- login ci "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
+          nix run github:zhaofengli/attic#default -- use "${ATTIC_CACHE}"
 
-      - name: Update cabal package index
-        run: cabal update
+      - name: Determine nix system
+        id: nix-system
+        run: echo "system=$(nix eval --raw --impure --expr 'builtins.currentSystem')" >> "$GITHUB_OUTPUT"
 
-      - name: Build
-        run: cabal build --enable-tests
+      - name: Build & test (flake checks)
+        run: nix build .#default .#checks.${{ steps.nix-system.outputs.system }}.tests
 
-      - name: Test
-        run: cabal test --enable-tests
+      - name: Push build artifacts to Attic
+        if: github.event_name != 'pull_request'
+        run: |
+          nix run github:zhaofengli/attic#default -- login ci "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
+          nix run github:zhaofengli/attic#default -- push "${ATTIC_CACHE}" "$(nix path-info .#default)" "$(nix path-info .#checks.${{ steps.nix-system.outputs.system }}.tests)"
