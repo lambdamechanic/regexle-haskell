@@ -103,8 +103,16 @@ For more details, see README.md and QUICKSTART.md.
 
 ### Git Remotes
 
-- When working with `lambdamechanic/*` forks, always use SSH so the existing agent handles auth:
+- When working with **private** `lambdamechanic/*` forks, use SSH so the existing agent handles auth:
   ```bash
   git remote set-url origin git@github.com:lambdamechanic/<repo>.git
   ```
-- If you encounter an HTTPS `lambdamechanic` remote, rewrite it to the SSH form before pushing.
+- For public forks or any environment (like Codex Web) that can only access HTTPS, leave the remote as `https://github.com/lambdamechanic/<repo>.git`. Do **not** rewrite to SSH unless you specifically need private-access credentials.
+
+### Submodules
+
+- After every fresh clone or checkout, run:
+  ```bash
+  git submodule update --init --recursive
+  ```
+  Codex Web currently clones the main repo but does *not* update submodules for you, so do this manually before running any benchmark or build that depends on `third_party/nelhage-sandbox` or `z3-415.3`.
