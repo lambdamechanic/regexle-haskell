@@ -45,3 +45,10 @@ scripts/compare_profiles.py \
 2. regex-35: rebuild transition lambda as an ITE ladder per column class.
 3. regex-36: stop round-tripping constraints through `Z3.Goal`.
 4. regex-37: ensure DFA minimisation matches `greenery.reduce()` results.
+
+## PyClone transition lambda guard vs baseline (side 3, days 400–401)
+
+- Baseline commit `a7ba800` (unguarded fallback) averaged ~75 ms to build and ~20 ms to solve each clue.
+- Guarded commit `62e1fd5` keeps the fallback branch conditional but adds about 5 ms to the build and 1–2 ms to the solve per clue, nudging total runtime up by roughly 7 %.
+- The guard prevents PyClone from asserting an unconditional transition, eliminating unsound states at the expense of a small runtime regression.
+- Profiles are captured in `benchmarks/profiles/side3-days400-401-pyclone-transition-comparison.json` with the exact command recorded in the artifact metadata.

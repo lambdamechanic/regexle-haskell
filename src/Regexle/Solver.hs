@@ -35,7 +35,7 @@ import qualified Data.IntSet as IntSet
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
@@ -834,6 +834,55 @@ assertAcceptStateZ3 sink stateDomain info finalState =
       cond <- Z3.mkOr comparisons
       csEmit sink cond
 
+buildTransitionLambdaBody :: StateDomain -> AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
+buildTransitionLambdaBody stateDomain alphabetDomain info st ch = do
+  statePairs <- forM (zip [0 :: Int ..] (V.toList (diTransitions info))) $ \(idx, row) -> do
+    rowExpr <- buildRowExpr row
+    cond <- Z3.mkEq st (stateLiteral stateDomain idx)
+    pure (cond, rowExpr)
+  case statePairs of
+    [] -> pure (stateLiteral stateDomain 0)
+    _ -> do
+      let (_, fallbackExpr) = last statePairs
+      buildIteLadder statePairs fallbackExpr
+  where
+    buildRowExpr row = do
+      let fallbackIdx = if V.null row then 0 else V.last row
+          fallbackLit = stateLiteral stateDomain fallbackIdx
+      classPairs <- fmap catMaybes $
+        forM (V.toList (diColumnClasses info)) (buildClassPair row fallbackIdx)
+      buildIteLadder classPairs fallbackLit
+
+    buildClassPair row fallbackIdx members = do
+      let idxs = V.toList members
+      case idxs of
+        [] -> pure Nothing
+        repIdx : rest -> do
+          mCond <- buildClassCondition (repIdx : rest)
+          case mCond of
+            Nothing -> pure Nothing
+            Just cond -> do
+              let destIdx =
+                    if repIdx < V.length row
+                      then row V.! repIdx
+                      else fallbackIdx
+              pure (Just (cond, stateLiteral stateDomain destIdx))
+
+    buildClassCondition [] = pure Nothing
+    buildClassCondition (firstIdx : restIdxs) = do
+      eqs <- forM (firstIdx : restIdxs) $ \idx -> do
+        let lit = alphabetLiteral alphabetDomain idx
+        Z3.mkEq ch lit
+      case eqs of
+        [] -> pure Nothing
+        [single] -> pure (Just single)
+        _ -> Just <$> Z3.mkOr eqs
+
+buildIteLadder :: [(Z3.AST, Z3.AST)] -> Z3.AST -> Z3.Z3 Z3.AST
+buildIteLadder pairs fallback = do
+  let step (cond, val) acc = Z3.mkIte cond val acc
+  foldrM step fallback pairs
+
 transitionLookupZ3 :: StateDomain -> AlphabetDomain -> DfaInfo -> Z3.AST -> Z3.AST -> Z3.Z3 Z3.AST
 transitionLookupZ3 stateDomain alphabetDomain info st ch = do
   let transitions = diTransitions info
@@ -917,7 +966,7 @@ buildTransitionFunction encoding stateDomain alphabetDomain info =
           charSort = adSort alphabetDomain
       stateBound <- Z3.mkBound 1 stateSort
       charBound <- Z3.mkBound 0 charSort
-      body <- transitionLookupZ3 stateDomain alphabetDomain info stateBound charBound
+      body <- buildTransitionLambdaBody stateDomain alphabetDomain info stateBound charBound
       stateSym <- Z3.mkStringSymbol "lambda_state"
       charSym <- Z3.mkStringSymbol "lambda_char"
       outer <- Z3.mkLambda [(stateSym, stateSort), (charSym, charSort)] body
