@@ -11,3 +11,11 @@ docker run --rm \
   --entrypoint /bin/bash \
   "$IMAGE" \
   -lc 'bd version && cabal --version'
+
+docker run --rm \
+  --platform linux/amd64 \
+  -v "${ROOT_DIR}:/workspace" \
+  -w /workspace \
+  --entrypoint /bin/bash \
+  "$IMAGE" \
+  -lc 'git config --global --add safe.directory /workspace && git config --global --add safe.directory "*" && git submodule update --init --recursive && cabal test --enable-tests'
