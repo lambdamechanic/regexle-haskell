@@ -1,6 +1,6 @@
 ATTIC_CACHE ?= lambdamechanic-main
 ATTIC_ENDPOINT ?= https://attic.app.lambdamechanic.com/
-ATTIC_CMD = nix run github:zhaofengli/attic\#default --
+ATTIC_CMD = attic
 ATTIC_TOKEN ?= $(shell cat .nix-attic-token 2>/dev/null)
 NIX_SYSTEM != nix eval --raw --impure --expr 'builtins.currentSystem'
 
