@@ -49,4 +49,4 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           nix run github:zhaofengli/attic#default -- login "${ATTIC_SERVER_ALIAS}" "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
-          nix run github:zhaofengli/attic#default -- push "${ATTIC_SERVER_ALIAS}:${ATTIC_CACHE}" "$(nix path-info .#default)" "$(nix path-info .#checks.${{ steps.nix-system.outputs.system }}.tests)"
+          nix run github:zhaofengli/attic#default -- push --jobs 16 "${ATTIC_SERVER_ALIAS}:${ATTIC_CACHE}" "$(nix path-info .#default)" "$(nix path-info .#checks.${{ steps.nix-system.outputs.system }}.tests)"
