@@ -26,6 +26,9 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
 
+      - name: Ensure clean working tree
+        run: scripts/require-clean-git.sh
+
       - name: Validate Attic secret
         run: |
           if [ -z "${ATTIC_TOKEN}" ]; then

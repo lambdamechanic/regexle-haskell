@@ -124,3 +124,4 @@ For more details, see README.md and QUICKSTART.md.
   nix run github:zhaofengli/attic#default -- push --jobs 16 <cache> <paths...>
   ```
 - The `make push` target and CI workflow already include `--jobs 16`; mirror that flag in any manual `attic push`/`attic pull` invocation to keep timings consistent with GitHub Actions.
+- Never push cached artifacts from a dirty working tree. The repo ships `scripts/require-clean-git.sh`, and `make push` calls it automatically; if you truly need to bypass it (e.g., emergency debugging), set `ALLOW_DIRTY_PUSH=1` explicitly.

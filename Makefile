@@ -4,13 +4,13 @@ ATTIC_CMD = nix run github:zhaofengli/attic\#default --
 ATTIC_TOKEN ?= $(shell cat .nix-attic-token 2>/dev/null)
 NIX_SYSTEM != nix eval --raw --impure --expr 'builtins.currentSystem'
 
-.PHONY: pull push build checks test _attic-login _test-only _test-with-cache
+.PHONY: pull push build checks test _attic-login _test-only _test-with-cache require-clean
 
 pull: _attic-login
 	$(ATTIC_CMD) use $(ATTIC_CACHE)
 	nix build .#default .#checks.$(NIX_SYSTEM).tests
 
-push: _attic-login
+push: _attic-login require-clean
 	@default_path=$$(nix path-info .#default); \
 	check_path=$$(nix path-info .#checks.$(NIX_SYSTEM).tests); \
 	$(ATTIC_CMD) push --jobs 16 $(ATTIC_CACHE) $$default_path $$check_path
@@ -37,3 +37,6 @@ _attic-login:
 		exit 1; \
 	fi
 	$(ATTIC_CMD) login cli "$(ATTIC_ENDPOINT)" "$(ATTIC_TOKEN)"
+
+require-clean:
+	./scripts/require-clean-git.sh
