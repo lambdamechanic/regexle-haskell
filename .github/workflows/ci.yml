@@ -27,6 +27,13 @@ jobs:
             accept-flake-config = true
 
       - name: Install Attic CLI
+        env:
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            substituters = https://attic.app.lambdamechanic.com/lambdamechanic-main https://cache.nixos.org/
+            trusted-public-keys = lambdamechanic-main:5wNxMhT/4Jdev6LshHRyV7B3YTQZzfj+e8dyWDFyoNU= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            access-tokens = attic.app.lambdamechanic.com=${ATTIC_TOKEN}
         run: nix profile install github:zhaofengli/attic#default
 
       - name: Ensure clean working tree
