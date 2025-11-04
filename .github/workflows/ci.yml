@@ -9,14 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      NIX_CONFIG: |
-        experimental-features = nix-command flakes
-        accept-flake-config = true
-        extra-substituters = https://attic.app.lambdamechanic.com/lambdamechanic-main https://cache.nixos.org/
-        extra-trusted-public-keys = lambdamechanic-main:5wNxMhT/4Jdev6LshHRyV7B3YTQZzfj+e8dyWDFyoNU= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
       ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
       ATTIC_CACHE: lambdamechanic-main
       ATTIC_ENDPOINT: https://attic.app.lambdamechanic.com/
+      ATTIC_SERVER_ALIAS: ci
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,8 +35,8 @@ jobs:
 
       - name: Configure Attic cache
         run: |
-          nix run github:zhaofengli/attic#default -- login ci "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
-          nix run github:zhaofengli/attic#default -- use "${ATTIC_CACHE}"
+          nix run github:zhaofengli/attic#default -- login "${ATTIC_SERVER_ALIAS}" "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
+          nix run github:zhaofengli/attic#default -- use "${ATTIC_SERVER_ALIAS}:${ATTIC_CACHE}"
 
       - name: Determine nix system
         id: nix-system
@@ -52,5 +48,5 @@ jobs:
       - name: Push build artifacts to Attic
         if: github.event_name != 'pull_request'
         run: |
-          nix run github:zhaofengli/attic#default -- login ci "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
-          nix run github:zhaofengli/attic#default -- push "${ATTIC_CACHE}" "$(nix path-info .#default)" "$(nix path-info .#checks.${{ steps.nix-system.outputs.system }}.tests)"
+          nix run github:zhaofengli/attic#default -- login "${ATTIC_SERVER_ALIAS}" "${ATTIC_ENDPOINT}" "${ATTIC_TOKEN}"
+          nix run github:zhaofengli/attic#default -- push "${ATTIC_SERVER_ALIAS}:${ATTIC_CACHE}" "$(nix path-info .#default)" "$(nix path-info .#checks.${{ steps.nix-system.outputs.system }}.tests)"
