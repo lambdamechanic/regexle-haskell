@@ -3,12 +3,13 @@ ATTIC_ENDPOINT ?= https://attic.app.lambdamechanic.com/
 ATTIC_CMD = attic
 ATTIC_TOKEN ?= $(shell cat .nix-attic-token 2>/dev/null)
 NIX_SYSTEM != nix eval --raw --impure --expr 'builtins.currentSystem'
+NIX_BUILD = nix build --no-link
 
 .PHONY: pull push build checks test _attic-login _test-only _test-with-cache require-clean
 
 pull: _attic-login
 	$(ATTIC_CMD) use $(ATTIC_CACHE)
-	nix build .#default .#checks.$(NIX_SYSTEM).tests
+	$(NIX_BUILD) .#default .#checks.$(NIX_SYSTEM).tests
 
 push: _attic-login require-clean
 	@default_path=$$(nix path-info .#default); \
@@ -16,13 +17,13 @@ push: _attic-login require-clean
 	$(ATTIC_CMD) push --jobs 16 $(ATTIC_CACHE) $$default_path $$check_path
 
 build:
-	nix build .#default
+	$(NIX_BUILD) .#default
 
 checks:
-	nix build .#checks.$(NIX_SYSTEM).tests
+	$(NIX_BUILD) .#checks.$(NIX_SYSTEM).tests
 
 _test-only:
-	nix build .#checks.$(NIX_SYSTEM).tests
+	$(NIX_BUILD) .#checks.$(NIX_SYSTEM).tests
 
 _test-with-cache:
 	$(MAKE) pull
